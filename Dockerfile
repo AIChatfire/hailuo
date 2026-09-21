@@ -7,6 +7,13 @@
 
 FROM python:3.12-slim AS base
 
+# --- 版本与来源（发布工作流注入；label 也是 GHCR 包与仓库关联的依据）
+ARG APP_VERSION=0.0.0-dev
+LABEL org.opencontainers.image.title="hailuo" \
+      org.opencontainers.image.version="$APP_VERSION" \
+      org.opencontainers.image.source="https://github.com/AIChatfire/hailuo" \
+      org.opencontainers.image.licenses="MIT"
+
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     PIP_NO_CACHE_DIR=1 \
@@ -20,10 +27,12 @@ COPY requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
 
 # --- 应用代码
+# ⚠️ 不要 `COPY docs`：`.dockerignore` 排除了 docs/，COPY 一个被 ignore 的路径会
+#    **直接构建失败**（"excluded by .dockerignore"），而且这里也**从未真跑过构建** ——
+#    CI 冒烟走的是宿主 gunicorn，不是镜像。docs/ 只有注释层面被引用（运行期不读）。
 COPY app ./app
 COPY gunicorn_conf.py ./
 COPY scripts ./scripts
-COPY docs ./docs
 
 # --- 非 root 运行
 # 任务库默认落在工作目录（SQLite）⇒ 目录必须对运行用户可写。
