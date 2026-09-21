@@ -95,14 +95,67 @@ jobs:
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
           echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"   # 镜像 tag 不带 v 前缀
 
-  build-and-push:
+  bump:
+    # 版本号写回：`/openapi.json` 与 FastAPI app 报的 version 来自 app/__init__.py，
+    # 只打 tag 会让镜像里的自报版本永远停在旧值 ⇒ auto 模式下把常量改成发布版本，
+    # **在构建之前**执行，这样镜像、tag、Release、自报版本四者一致。
+    # 人工 tag 模式**不改代码** —— 保证"tag 内容 == 构建内容"（人工发版时请自行同步常量）。
     needs: resolve
+    if: ${{ needs.resolve.outputs.mode != 'skip' }}
+    runs-on: ubuntu-latest
+    outputs:
+      sha: ${{ steps.b.outputs.sha }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.resolve.outputs.commit }}
+          fetch-depth: 0
+      - id: b
+        env:
+          MODE: ${{ needs.resolve.outputs.mode }}
+          VERSION: ${{ needs.resolve.outputs.version }}
+          TAG: ${{ needs.resolve.outputs.tag }}
+        run: |
+          set -euo pipefail
+          # annotated tag 与提交都需要 committer 身份（runner 上没有全局 git 配置）
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if [ "$MODE" != "auto" ]; then
+            echo "人工 tag 模式：不改代码（tag 内容 == 构建内容）"
+            echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          python3 - "$VERSION" <<'PY'
+          import pathlib, re, sys
+          p = pathlib.Path("app/__init__.py")
+          t = p.read_text(encoding="utf-8")
+          out, n = re.subn(r'__version__ = "[^"]*"', f'__version__ = "{sys.argv[1]}"', t)
+          assert n == 1, f"__version__ 锚点命中 {n} 次（应为 1）"
+          if out != t:
+              p.write_text(out, encoding="utf-8")
+              print(f"__version__ → {sys.argv[1]}")
+          else:
+              print(f"__version__ 已是 {sys.argv[1]} —— 无需改动")
+          PY
+          if ! git diff --quiet -- app/__init__.py; then
+            git add app/__init__.py
+            # 提交信息带跳过标记做兜底（GITHUB_TOKEN 推的提交本就不触发 workflow）
+            git commit -q -m "chore(release): $TAG 版本号写回 [skip release]"
+            git pull --rebase -q origin main
+            git push origin HEAD:main
+          fi
+          SHA=$(git rev-parse HEAD)
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+          echo "写回后提交：$SHA"
+
+  build-and-push:
+    needs: [resolve, bump]
     if: ${{ needs.resolve.outputs.mode != 'skip' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ needs.resolve.outputs.commit }}
+          ref: ${{ needs.bump.outputs.sha }}
       - name: 登录 GHCR
         run: |
           echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
@@ -171,13 +224,13 @@ jobs:
           docker push "$IMAGE:sha-$SHA7"
 
   release:
-    needs: [resolve, build-and-push]
+    needs: [resolve, bump, build-and-push]
     if: ${{ needs.resolve.outputs.mode != 'skip' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ needs.resolve.outputs.commit }}
+          ref: ${{ needs.bump.outputs.sha }}
           fetch-depth: 0
       - name: 打版本 tag（仅 auto 模式；人工 tag 模式用已存在的那个）
         if: ${{ needs.resolve.outputs.mode == 'auto' }}
