@@ -58,13 +58,17 @@ jobs:
             echo "sha7=$(git rev-parse --short=7 HEAD)"
           } >> "$GITHUB_OUTPUT"
 
-          # 逃生阀：在第一个 job 内判定并输出 mode=skip，而不是用 job 级 if
-          # （job 被 skip 会级联 skip 下游；这里下游按 mode 决定跑不跑）
-          MSG=$(git log -1 --pretty=%B)
-          if printf '%s' "$MSG" | grep -qF '[skip release]'; then
-            echo "mode=skip" >> "$GITHUB_OUTPUT"
-            echo "提交信息命中跳过标记 —— 本次不发版（不产 tag / 镜像 / Release）"
-            exit 0
+          # 逃生阀：**只在 push 事件上生效**。dispatch 是人的显式发版意图；
+          # 且 dispatch 检出的往往就是那个带标记的提交 —— 不加这道门，
+          # "带标记的提交之后想人工补发"会被自己的标记永久挡住（实测踩过：
+          # push 的标记提交 ⇒ dispatch 补发 ⇒ 仍然 skipped）。
+          if [ "${GITHUB_EVENT_NAME}" = "push" ]; then
+            MSG=$(git log -1 --pretty=%B)
+            if printf '%s' "$MSG" | grep -qF '[skip release]'; then
+              echo "mode=skip" >> "$GITHUB_OUTPUT"
+              echo "提交信息命中跳过标记 —— 本次不发版（不产 tag / 镜像 / Release）"
+              exit 0
+            fi
           fi
 
           INPUT_TAG="${{ inputs.tag }}"
