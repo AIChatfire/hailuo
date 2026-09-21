@@ -16,10 +16,18 @@
 | `GET` | `/async/v1/models` | `200` | 能力清单（OpenAI 形态 + 上游模型注册表） |
 
 运维端点（**不属于对外契约**）：`GET /healthz`（零依赖，容器探活用）、
-`GET /readyz`（会 ping 一次库与凭据配置）、`GET /stats`、`GET /capabilities`。
+`GET /readyz`（只 ping 一次库 —— 凭据随请求来，探针不替上游判 token 有效性）、`GET /stats`、`GET /capabilities`。
 
-鉴权：`Authorization: Bearer <key>`。`API_KEYS` 为空时**关闭鉴权**（仅限内网，
-启动会打 WARNING）。任务与 Key 指纹绑定。
+鉴权（**透传**，2026-09-21 起唯一方式）：`Authorization: Bearer <你的 hailuo 登录 token>`。
+
+- 该 token **同时就是上游凭证** —— 任务全程（建任务/轮询/OSS 上传）都用它
+  ⇒ **费用记在 token 所有者账上**；服务端**不持有任何账号凭据**，
+  因此也不存在"白名单 key"或"服务端账号"这一档（无向后兼容包袱）。
+- 本地只校验**结构与 `exp`**（**不验签**：没有签名密钥）；伪造/过期 token
+  由**上游**兜住（会拿 401）—— 本地这层只为"早失败、少一次往返"。
+- 明文 token **绝不落库**（库中只有指纹）；它驻留进程内存池，
+  进程重启/TTL 过期后在途任务会以 `503 credential_unavailable` 明确失败。
+- 任务与**凭据指纹**绑定（不同 token 的任务互相看不见）。
 
 ---
 
@@ -27,7 +35,7 @@
 
 ```http
 POST /async/v1/images/generations
-Authorization: Bearer <key>
+Authorization: Bearer <你的 hailuo 登录 token>
 Content-Type: application/json
 
 {
@@ -183,8 +191,8 @@ GET /async/v1/images/generations/{task_id}
 鉴权语义（三种情况分得很清，刻意不合并）：
 
 - **完全没带** `Authorization` ⇒ **放行**。理由：`task_id` 是不可猜的 128 位随机值，
-  且只在受理时返回给带 Key 的调用方 ⇒ **id 本身就是凭据**（可以把结果链接直接给别人看）。
-- **带了但无效** ⇒ **照旧 `401`**。不能因为"反正放行"就把错的 Key 蒙过去 ——
+  且只在受理时返回给带凭据的调用方 ⇒ **id 本身就是凭据**（可以把结果链接直接给别人看）。
+- **带了但无效** ⇒ **照旧 `401`**。不能因为"反正放行"就把错的凭据蒙过去 ——
   那会让调用方的配置错误被静默吞掉，是最难查的一类问题。
 - **带了且有效、但不是该任务的属主** ⇒ **照样能查**（与"没带"同一待遇，语义统一好预测）。
 

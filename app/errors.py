@@ -144,6 +144,19 @@ class UpstreamNotConfigured(AdapterError):
     error_type = "service_unavailable"
 
 
+class CredentialUnavailable(AdapterError):
+    """透传凭据不在内存池里（进程重启 / 已过期 / 被容量淘汰）。
+
+    **不是 401**：调用方那一次请求当时是合法的 —— 是服务端在这一刻拿不出
+    对应凭据（明文凭据不落库，重启即丢）。任务会以本错误失败并**明确说明原因**，
+    绝不静默改用服务端账号（那会把费用记到错误的人头上）。
+    """
+
+    status_code = 503
+    code = "credential_unavailable"
+    error_type = "service_unavailable"
+
+
 class CapabilityUnavailable(AdapterError):
     """能力当前不可用（如上游能力表读不到且无冻结快照）。"""
 

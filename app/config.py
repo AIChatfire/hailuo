@@ -68,6 +68,9 @@ class Settings:
     # ------------------------------------------------------------ 上游凭据
     #: hailuo 的**唯一**硬前提凭据：浏览器 localStorage 里的 JWT，随 `token` 头发送。
     #: 取法：登录 hailuoai.video → DevTools → Application → Local Storage → 找 JWT。
+    #: **运维凭据（可选）**：脚本、E2E、嵌入模式用；服务本身**不再需要**它 ——
+    #: 服务端鉴权是透传（请求自带 hailuo JWT）。留它是为了让脚本能
+    #: `register_credential()` 后直接跑，无需额外配置。
     hailuo_token: str = ""
     hailuo_base_url: str = "https://hailuoai.video"
 
@@ -90,7 +93,6 @@ class Settings:
 
     # ------------------------------------------------------------ 对外鉴权
     #: 空 = **关闭鉴权**（仅限内网/联调；启动打 WARNING 兜底）。
-    api_keys: tuple[str, ...] = ()
 
     # ------------------------------------------------------------ 节奏闸门
     #: 同时在上游跑的任务数。默认 1 = 策略选择（hailuo 是**计费**上游）。
@@ -181,10 +183,6 @@ class Settings:
         return bool((self.hailuo_token or "").strip())
 
     @property
-    def auth_enabled(self) -> bool:
-        return bool(self.api_keys)
-
-    @property
     def db_target(self) -> str:
         return self.task_db
 
@@ -233,7 +231,7 @@ class Settings:
             hailuo_browser_platform=_s("HAILUO_BROWSER_PLATFORM", "MacIntel"),
             hailuo_screen_width=_i("HAILUO_SCREEN_WIDTH", 2560),
             hailuo_screen_height=_i("HAILUO_SCREEN_HEIGHT", 1440),
-            api_keys=_csv("API_KEYS"),
+
             hl_concurrency=_i("HL_CONCURRENCY", 1),
             hl_min_interval=_f("HL_MIN_INTERVAL", 0.0),
             hl_per_minute=_i("HL_PER_MINUTE", 0),
@@ -296,14 +294,10 @@ class Settings:
                 "HAILUO_SCREEN_WIDTH/HEIGHT 必须为正整数（它们参与签名）")
 
         self.startup_warnings = []
-        if not self.auth_enabled:
-            self.startup_warnings.append(
-                "API_KEYS 为空 —— 对外鉴权已关闭。仅限内网/联调："
-                "任何能访问本端口的人都能消耗你的 hailuo 额度。")
         if not self.upstream_configured:
             self.startup_warnings.append(
-                "HAILUO_TOKEN 未配置 —— 服务可启动，但 POST /async/v1/images/generations "
-                "会返回 503（upstream_not_configured）。")
+                "HAILUO_TOKEN 未配置 —— 服务对外可用（鉴权是透传：请求自带 hailuo JWT），"
+                "但 scripts/ 下的运维脚本与嵌入模式需要它。")
         if self.hl_concurrency > 2:
             self.startup_warnings.append(
                 f"HL_CONCURRENCY={self.hl_concurrency} 超过本项目实测验证过的上限（2）。"

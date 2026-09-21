@@ -97,23 +97,24 @@ def _bearer(request: Request) -> str | None:
 
 
 def require_key(request: Request) -> str:
-    """校验调用方 Key，返回**凭证指纹**（不是明文）。
+    """校验调用方凭据，返回**凭证指纹**（不是明文）。
 
-    · 未配置 `API_KEYS` ⇒ 鉴权关闭（dev），返回 `anonymous` 的指纹；
-    · 配置了 ⇒ 必须带 Bearer，且必须在白名单里。
+    ## 唯一的入口鉴权方式：**hailuo JWT 透传**（2026-09-21 起）
+
+    `Authorization: Bearer <你的 hailuo 登录 token>` —— 该 token **同时就是上游凭证**：
+    任务全程（建任务/轮询/OSS 上传）都用它 ⇒ **费用记在 token 所有者账上**。
+    服务端不持有任何账号凭据，因此**无需也不支持**白名单 key。
+
+    本地只做"结构 + `exp`"校验（**不验签** —— 没有签名密钥）：
+    伪造/过期 token 会在上游拿到 401，本地这层是为了早失败、少一次往返。
     """
-    settings: Settings = request.app.state.settings
+    service: Service = request.app.state.service
     key = _bearer(request)
-    if not settings.auth_enabled:
-        return request.app.state.service.credential_of(None)
     if not key:
-        raise AuthError("缺少 Authorization: Bearer <key>")
-    #: ⚠️ 已知弱点：这是**明文元组的 `in`**（逐元素 `==`），**不是恒定时间比较**。
-    #: 正确写法是 `hmac.compare_digest`。API Key 是高熵随机串，实际利用难度大，
-    #: 但这里如实标注而不是粉饰。
-    if key not in settings.api_keys:
-        raise AuthError("API Key 无效")
-    return request.app.state.service.credential_of(key)
+        raise AuthError(
+            "缺少 Authorization: Bearer <token> —— 请传你的 hailuo 登录 token"
+            "（浏览器 F12 里任意请求的 `token` 头 / JWT 形态的那串）。")
+    return service.register_credential(key)
 
 
 def require_key_optional(request: Request) -> str | None:
@@ -341,18 +342,19 @@ def _install_routes(app: FastAPI) -> None:
     async def readyz(request: Request) -> JSONResponse:
         """就绪探针：**依赖项不通就报 503**，让编排层不要往这里导流量。
 
-        查两件真正决定"能不能接活"的事：任务库可连、上游凭据已配。
+        查真正决定"能不能接活"的事：任务库可连即可。
+
+        ⚠️ **不再检查"服务端 token"** —— 鉴权是透传（凭据随请求来），
+        服务端本来就不持有账号凭据；"某个调用方 token 是否有效"是**上游**说了算，
+        不该由一个探针替它下结论。
         它比 `/healthz` 贵（会 ping 一次库），所以**不要**拿它当容器 HEALTHCHECK。
         """
         svc: Service = request.app.state.service
         if not svc.store.ping():
             return JSONResponse(status_code=503, content={
                 "status": "not_ready", "reason": "任务库不可连", "dsn": svc.store.dsn})
-        if not svc.settings.upstream_configured:
-            return JSONResponse(status_code=503, content={
-                "status": "not_ready",
-                "reason": "未配置 HAILUO_TOKEN，受理会返回 503"})
-        return JSONResponse(status_code=200, content={"status": "ready"})
+        return JSONResponse(status_code=200, content={
+            "status": "ready", "auth": "jwt-passthrough"})
 
     @app.get("/stats")
     async def stats(request: Request) -> dict:

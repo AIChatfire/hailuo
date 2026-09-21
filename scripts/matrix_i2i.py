@@ -133,7 +133,7 @@ def build_cases(pool: list[str]) -> list[tuple[str, dict]]:
     ]
 
 
-def negative_checks(svc: object, pool: list[str]) -> list[dict]:
+def negative_checks(svc: object, pool: list[str], credential: str) -> list[dict]:
     """负例：**只走本地校验**（400 在受理阶段就拦下，不发上游、不计费）。"""
     from app.errors import InvalidParameterError
 
@@ -148,7 +148,7 @@ def negative_checks(svc: object, pool: list[str]) -> list[dict]:
          {"model": "image-01", "prompt": "x", "image": [pool[0]]}),
     ):
         try:
-            svc.create(body, credential="i2i-matrix")  # type: ignore[attr-defined]
+            svc.create(body, credential=credential)  # type: ignore[attr-defined]
             out.append({"case": name, "expected": "400", "got": "被受理（❌ 未拦截）",
                         "ok": False})
         except InvalidParameterError as e:
@@ -162,12 +162,12 @@ def negative_checks(svc: object, pool: list[str]) -> list[dict]:
     return out
 
 
-def submit_case(svc: object, name: str, body: dict) -> dict:
+def submit_case(svc: object, name: str, body: dict, credential: str) -> dict:
     entry: dict = {"case": name, "request": {"model": body.get("model"),
                                              "image_count": len(body.get("image") or []),
                                              "resolution": body.get("resolution")}}
     try:
-        rec = svc.create(body, credential="i2i-matrix")  # type: ignore[attr-defined]
+        rec = svc.create(body, credential=credential)  # type: ignore[attr-defined]
         entry["task_id"] = rec["task_id"]
         sub = svc.submit(rec["task_id"])  # type: ignore[attr-defined]
         entry["submitted"] = bool(sub.get("submitted"))
@@ -227,6 +227,8 @@ def main(argv: list[str] | None = None) -> int:
 
     st = Settings.from_env().replace(task_db=f"sqlite+pysqlite:///./{DB}")
     svc = Service(st, fetch_capabilities=False)
+    #: 🔴 透传鉴权：脚本用自己的 HAILUO_TOKEN 登记一个凭据
+    credential = svc.register_credential(st.hailuo_token)
     results: list[dict] = []
     try:
         pool = ref_pool(limit=20)  # ⚠️ 必须 >14：超限负例要凑够 15 张才有意义
@@ -249,7 +251,7 @@ def main(argv: list[str] | None = None) -> int:
 
         # ---- 负例（免费，不发上游）
         header("负例校验（本地拦截，不发上游）")
-        negatives = negative_checks(svc, pool)
+        negatives = negative_checks(svc, pool, credential)
         for n in negatives:
             print(f"  {'✅' if n['ok'] else '❌'} {n['case']:<24} {n['got']}")
         if args.negatives_only:
@@ -262,7 +264,7 @@ def main(argv: list[str] | None = None) -> int:
         entries = []
         for i, (name, body) in enumerate(cases, 1):
             print(f"\n—— 提交 {i}/{len(cases)} {name} ——", flush=True)
-            entries.append(submit_case(svc, name, body))
+            entries.append(submit_case(svc, name, body, credential))
         in_flight = {e["task_id"] for e in entries if e.get("submitted")}
         print(f"\n已提交 {len(in_flight)}/{len(entries)}，进入并行收口", flush=True)
 

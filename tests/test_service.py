@@ -15,7 +15,6 @@ from app.errors import (
     InvalidParameterError,
     TaskNotDeletable,
     TaskNotFoundError,
-    UpstreamNotConfigured,
 )
 from app.service import view
 from app.store import ST_FAILURE, ST_IN_PROGRESS, ST_QUEUED, ST_SUCCEEDED
@@ -515,25 +514,78 @@ def test_pre_create_failure_is_marked_for_retry(service, fake) -> None:
     assert getattr(ei2.value, "pre_create", False) is False
 
 
-def test_submit_requires_token(settings, store, fake) -> None:
-    """未配凭据 ⇒ 503（**部署问题**），而不是 401。"""
-    from app.upstream.hailuo import upload as up_mod
-    from app.upstream.hailuo.client import HailuoClient
+def test_submit_without_credential_is_503(settings, store, fake) -> None:
+    """**透传语义**：任务的凭据不在池里（进程重启/过期/从未登记）⇒ 503。
+
+    这是**服务端状态问题**，不是调用方凭据错（那次请求当时合法）⇒
+    503 `credential_unavailable`，而**不是** 401。
+    🔴 且绝不允许"回落到别的账号" —— 那会把费用记到错误的人头上。
+    """
+
+    from app.errors import CredentialUnavailable
     from app.service import Service
 
-    import httpx
+    #: 不注入 client/uploader ⇒ 走透传池；凭据从未登记 ⇒ 必然命中"池里没有"
+    svc = Service(settings, store=store, fetch_capabilities=False,
+                  http_transport=fake.transport())
+    try:
+        rec = svc.create({"prompt": "x"}, credential="never-registered")
+        with pytest.raises(CredentialUnavailable) as ei:
+            svc.submit(rec["task_id"])
+        assert ei.value.status_code == 503
+        assert "重新提交" in str(ei.value)
+    finally:
+        svc.close()
 
-    st = settings.replace(hailuo_token="")
-    svc = Service(st, store=store, client=HailuoClient(
-        token="", base_url="https://hailuoai.video", transport=fake.transport()),
-        uploader=up_mod.Uploader(client=HailuoClient(token="", transport=fake.transport()),
-                                 oss_client=httpx.Client(transport=fake.transport())),
-        fetch_capabilities=False, http_transport=fake.transport())
-    rec = svc.create({"prompt": "x"}, credential="c")
-    with pytest.raises(UpstreamNotConfigured) as ei:
-        svc.submit(rec["task_id"])
-    assert ei.value.status_code == 503
-    svc.close()
+
+def test_poll_fails_tasks_whose_credential_vanished(settings, store, fake) -> None:
+    """在途任务的凭据消失（重启）⇒ 该组任务**明确失败**，不留僵尸。
+
+    语义取舍：任务全生命周期都需要这个 token（轮询也要）⇒ 拿不出就永远推进不了，
+    明说原因比静默卡死诚实。
+    """
+    from app.errors import CredentialUnavailable
+    from app.service import Service
+
+    svc = Service(settings, store=store, fetch_capabilities=False,
+                  http_transport=fake.transport())
+    try:
+        rec = svc.create({"prompt": "x"}, credential="ghost")
+        svc.store.update_task(rec["task_id"], status="in_progress",
+                              upstream_batch_id="b-ghost", submitted_at=1.0)
+        svc.poll_many(svc.store.in_flight())
+        full = svc.store.get_full(rec["task_id"])
+        assert full["status"] == "failure"
+        assert full["error"]["code"] == "credential_unavailable"
+        assert "内存池" in full["error"]["message"]
+        _ = CredentialUnavailable  # 语义锚点：失败原因就是这个类
+    finally:
+        svc.close()
+
+
+def test_clients_are_routed_per_credential(settings, store, fake) -> None:
+    """🔴 **按凭据路由**：两个 JWT 各自的建任务请求必须带**各自的 token** 出站。"""
+    from .conftest import FAKE_JWT, FAKE_JWT_B
+    from app.service import Service
+
+    svc = Service(settings, store=store, fetch_capabilities=False,
+                  http_transport=fake.transport())
+    try:
+        fp_a = svc.register_credential(FAKE_JWT)
+        fp_b = svc.register_credential(FAKE_JWT_B)
+        assert fp_a != fp_b, "不同 token ⇒ 不同指纹（任务隔离的基础）"
+
+        for fp in (fp_a, fp_b):
+            rec = svc.create({"prompt": "x"}, credential=fp)
+            svc.submit(rec["task_id"])
+
+        assert len(fake.create_calls) == 2
+        #: 两条建任务分别带着 A / B 的 token（顺序=提交顺序）
+        assert fake.tokens_seen == [FAKE_JWT, FAKE_JWT_B], fake.tokens_seen[:3]
+        #: 两个凭据 ⇒ 两套客户端（各自独立连接池与上传缓存）
+        assert svc.credentials.stats()["entries"] == 2
+    finally:
+        svc.close()
 
 
 # ---------------------------------------------------------------------------

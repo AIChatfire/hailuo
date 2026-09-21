@@ -37,6 +37,9 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
+#: 合成 JWT：透传鉴权用（**零真实凭据** —— 服务零出网，任何真实调用都不会发生）
+from tests.conftest import FAKE_JWT  # noqa: E402
+
 #: 本地探针的临时任务库（不碰生产库）
 PROBE_DB = os.environ.get("E2E_DB", "sqlite+pysqlite:///./e2e_probe.db")
 
@@ -155,7 +158,10 @@ def phase_accept(token: str) -> bool:
 
     st = build_settings(token=token, coordinator=False)
     svc = Service(st, fetch_capabilities=True)
-    app = create_app(st.replace(api_keys=("sk-e2e",)), service=svc)
+    from tests.conftest import FAKE_JWT
+
+    app = create_app(st, service=svc)
+    svc.register_credential(FAKE_JWT)
     client = TestClient(app)
 
     r = client.post("/async/v1/images/generations",
@@ -309,7 +315,7 @@ def phase_generate(token: str, image: str) -> bool:
             payload["image"] = [image]
             mode = "图生图(i2i)"
         print(f"  模式：{mode}  model=nano_banana21_flash  resolution=1K  n=1")
-        rec = svc.create(payload, credential="e2e")
+        rec = svc.create(payload, credential=svc.credential_of(FAKE_JWT))
         print(f"  受理 {rec['task_id']}，正在建任务…")
         out = svc.submit(rec["task_id"])
         print(f"{OK if out.get('submitted') else NO} {out.get('upstream_batch_id') or out}")

@@ -184,15 +184,16 @@ jobs:
         env:
           IMAGE: ${{ needs.resolve.outputs.image }}
           VERSION: ${{ needs.resolve.outputs.version }}
+          #: 合成 JWT（结构合法 + exp 远未来）：**透传鉴权**下入口只认这个形态。
+          #: 它不是真 token —— 服务端不持有任何账号凭据，冒烟全程零上游调用。
+          SMOKE_JWT: "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJleHAiOjQxMDI0NDQ4MDAsInVzZXIiOnsiaWQiOiIxMDAwIiwibmFtZSI6ImNpLXNtb2tlIiwiZGV2aWNlSUQiOiIxMDAwMDAwMDAwMDAwMDAwMDAifX0.Y2ktc21va2Utc2ln"
         run: |
           set -euo pipefail
-          # COORDINATOR_ENABLED=0 是**必须**的：协调器默认开启，而建任务是计费动作；
-          # token 用假的（我们不希望任何真实调用）。TASK_DB 指向容器内可写目录。
+          # COORDINATOR_ENABLED=0 是**必须**的：协调器默认开启，而建任务是计费动作。
+          # 服务端已不需要 HAILUO_TOKEN（凭据随请求透传）。TASK_DB 指向容器内可写目录。
           docker run -d --name smoke \
             -p 18300:8300 \
             -e COORDINATOR_ENABLED=0 \
-            -e HAILUO_TOKEN=smoke-test-not-a-real-token \
-            -e API_KEYS=sk-smoke \
             -e TASK_DB='sqlite+pysqlite:////app/data/smoke.db' \
             "$IMAGE:$VERSION"
           trap 'echo "=== 冒烟失败，容器日志 ==="; docker logs smoke || true' ERR
@@ -207,7 +208,7 @@ jobs:
           echo
           # 受理契约：只回一个 task_id（协调器关 ⇒ 零上游往返、零计费）
           curl -s -X POST http://127.0.0.1:18300/async/v1/images/generations \
-            -H 'Authorization: Bearer sk-smoke' -H 'Content-Type: application/json' \
+            -H "Authorization: Bearer $SMOKE_JWT" -H 'Content-Type: application/json' \
             -d '{"model":"hailuo-i2i","prompt":"smoke","image":["https://example.com/a.png"]}' \
             | tee /tmp/accept.json
           python3 -c "import json;d=json.load(open('/tmp/accept.json'));assert set(d)=={'task_id'},d"

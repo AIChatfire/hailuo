@@ -124,11 +124,11 @@ def build_cases(svc: Any) -> list[tuple[str, dict]]:
     return cases
 
 
-def submit_case(svc: Any, name: str, body: dict) -> dict:
+def submit_case(svc: Any, name: str, body: dict, credential: str) -> dict:
     """受理 + 建任务（计费动作）。失败不中断矩阵（记录后继续下一个）。"""
     out: dict = {"case": name, "request": body}
     try:
-        rec = svc.create(body, credential="matrix")
+        rec = svc.create(body, credential=credential)
         out["task_id"] = rec["task_id"]
         sub = svc.submit(rec["task_id"])
         out["submitted"] = bool(sub.get("submitted"))
@@ -191,6 +191,8 @@ def main(argv: list[str] | None = None) -> int:
 
     st = Settings.from_env().replace(task_db="sqlite+pysqlite:///./e2e_matrix.db")
     svc = Service(st, fetch_capabilities=True)
+    #: 🔴 透传鉴权：脚本用自己的 HAILUO_TOKEN 登记一个凭据，任务记在它头上
+    credential = svc.register_credential(st.hailuo_token)
     results: list[dict] = []
     try:
         cases = build_cases(svc)
@@ -211,7 +213,7 @@ def main(argv: list[str] | None = None) -> int:
         entries: list[dict] = []
         for i, (name, body) in enumerate(cases, 1):
             print(f"\n—— 提交 {i}/{len(cases)} {name} ——", flush=True)
-            entry = submit_case(svc, name, body)  # type: ignore[arg-type]
+            entry = submit_case(svc, name, body, credential)  # type: ignore[arg-type]
             entries.append(entry)
         in_flight_ids = {e["task_id"] for e in entries if e.get("submitted")}
         print(f"\n已提交 {len(in_flight_ids)}/{len(entries)} 个任务，进入并行收口", flush=True)

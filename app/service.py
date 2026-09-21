@@ -47,13 +47,14 @@ from loguru import logger
 
 from . import media, models
 from .config import Settings
+from .credentials import CredentialPool, parse_jwt
 from .errors import (
     AdapterError,
     CapabilityUnavailable,
     InvalidParameterError,
     TaskNotDeletable,
     TaskNotFoundError,
-    UpstreamNotConfigured,
+    CredentialUnavailable,
 )
 from .gate import Gate, build as build_gate
 from .observability import OBS
@@ -205,6 +206,9 @@ class Service:
         self.gate: Gate = build_gate(settings)
         self._client = client
         self._uploader = uploader
+        #: 🔴 **透传凭据池**（AUTH_MODE=jwt）：指纹 → (token, 惰性客户端)。
+        #: 明文只存内存、绝不落库；进程重启即空 ⇒ 在途任务以 CredentialUnavailable 明确失败。
+        self.credentials = CredentialPool(transport=http_transport)
         #: 本服务自建 httpx 客户端时统一用它（输入图下载 + 能力表读取）
         #: —— **测试靠它做到零出网**。为 `None` 时走真实网络。
         self._http_transport = http_transport
@@ -245,13 +249,46 @@ class Service:
                 # 关闭失败不该影响进程退出，但**必须留痕** ——
                 # 否则"连接关不掉"这件事在任何地方都看不见。
                 logger.debug(f"{name} 关闭失败（已忽略）：{type(e).__name__}: {e}")
+        #: 透传池里的每凭据客户端（连接池）也要关 —— 否则进程退出时连接悬着
+        self.credentials.close_all()
         self.store.close()
 
-    def _require_upstream(self) -> None:
-        if not self.settings.upstream_configured:
-            raise UpstreamNotConfigured(
-                "服务未配置 HAILUO_TOKEN —— 这是**部署问题**："
-                "请联系部署方配置 hailuo 的登录 token。")
+    # ------------------------------------------------------------------ 凭据
+
+    def clients_for(self, credential: str | None) -> tuple[HailuoClient, up.Uploader]:
+        """按**凭据指纹**取 `(HailuoClient, Uploader)`。
+
+        · **嵌入模式**（构造时显式注入 `client`+`uploader`：测试、`scripts/` 与
+          宿主进程直接持有 Service 的情形）⇒ 用注入的实例；
+        · **HTTP 服务模式** ⇒ 从**透传凭据池**取；池里没有 ⇒ `CredentialUnavailable`
+          （进程重启/token 过期/被淘汰 —— **绝不回落到别的账号**，
+          否则费用会记到错误的人头上）。
+        """
+        if self._client is not None and self._uploader is not None:
+            return self._client, self._uploader
+        pair = self.credentials.clients_for(credential or "", self.settings)
+        if pair is None:
+            raise CredentialUnavailable(
+                "透传凭据已不在内存池（多为：服务重启，或 token 过期/被淘汰）。"
+                "明文凭据不落库，重启后无法恢复 —— 请用同一 token 重新提交任务；"
+                "若任务已建到上游，可用该账号在 hailuo 侧查看原批次。")
+        return pair
+
+    def register_credential(self, token: str) -> str:
+        """校验并登记一个**透传凭据**，返回凭证指纹。
+
+        入口鉴权（`main.require_key`）与运维脚本共用这一处 —— 校验规则只有一份。
+        """
+        claims = parse_jwt(token)
+        fingerprint = self.credential_of(token)
+        self.credentials.put(fingerprint, token, claims)
+        return fingerprint
+
+    def _fail_task(self, task_id: str, err: AdapterError) -> None:
+        """把任务判失败并带上**可读原因**（唯一判失败入口，避免各处自造形状）。"""
+        self.store.update_task(
+            task_id, status="failure", finished_at=time.time(),
+            error={"message": str(err), "type": err.error_type, "code": err.code})
 
     # ------------------------------------------------------------------ 公开访问器
     # 这两条存在的理由：协调器与 `/capabilities` 路由都要读它们。
@@ -273,9 +310,8 @@ class Service:
 
     def refresh_capabilities(self) -> list[str]:
         """运行期实读上游能力表（**零计费**）。读不到 ⇒ 退回冻结快照 + 留痕。"""
-        if not self.settings.upstream_configured:
-            self._caps_degradations = []
-            return []
+        #: 🔴 **不检查任何凭据**：能力表的两个端点是**公开免鉴权**的，
+        #: 透传模式下来源与费用都无关 ⇒ 直接读，失败按降级处理。
         try:
             #: 🔴 **刻意惰性导入**：`/healthz` 必须零依赖（容器每 30s 打它），
             #: 所以 httpx 只在这条真的要用它的路径上才加载。
@@ -609,9 +645,14 @@ class Service:
 
     # ------------------------------------------------------------------ 提交
 
-    def _ingest_one(self, url: str, *, dry_run: bool = False) -> tuple[Any, list[str], list[dict[str, Any]]]:
+    def _ingest_one(self, url: str, *, uploader: up.Uploader,
+                    dry_run: bool = False) -> tuple[Any, list[str], list[dict[str, Any]]]:
         """单张输入图的完整流水线：**取源**（http(s) 下载 或 data: base64 解码）
         → 归一化 → 上传。
+
+        ⚠️ `uploader` 由调用方按**凭据**传入：上传结果是**账号级**资产
+        （fileID 只在那个账号里有效）⇒ 上传缓存也必须按凭据隔离 ——
+        每个凭据各有自己的 `Uploader`（见 `credentials.clients_for`）。
 
         张与张相互独立 ⇒ 线程池里并行跑；异常原样上抛
         （任一张失败 ⇒ 整个任务 failure，与串行版语义一致）。
@@ -623,7 +664,7 @@ class Service:
             blob, max_side=self.settings.normalize_max_side,
             max_bytes=self.settings.normalize_max_bytes,
             enabled=self.settings.normalize_uploads)
-        uploaded, traces = self.uploader.upload_bytes(
+        uploaded, traces = uploader.upload_bytes(
             content=blob.data, mime=blob.mime, name=blob.name, dry_run=dry_run)
         return uploaded, notes, traces
 
@@ -643,25 +684,30 @@ class Service:
             logger.bind(task_id=task_id).debug(f"闸门拦截：{decision.reason}")
             return {"submitted": False, "reason": decision.reason}
 
-        self._require_upstream()
-
         # ① 输入图 → fileList（**并行 ingest**：取源→归一化→上传，每张一条独立流水线）
         # 张与张相互独立 ⇒ 墙钟 ≈ 最慢一张，而不是求和（三参考实测 ~20s → ~5s）。
         # 🔴 这一段的失败**一定没有**上游任务（可能连建任务请求都没发出）
         # ⇒ 标记 `pre_create`，协调器据此判断"可安全重试"还是"判失败"。
+        #: 🔴 本任务的**凭据客户端**：透传模式下就是调用方那个 token 的客户端
+        #: （建任务/上传/后续轮询同一账号；费用与资产都记在它头上）。
+        client, uploader = self.clients_for(full.get("credential_id"))
+
         image_urls = list(plan.get("image_urls") or [])
         file_list: list[dict[str, Any]] = []
         try:
             if image_urls:
                 workers = max(1, min(self.settings.ingest_parallelism, len(image_urls)))
                 if workers == 1:
-                    results = [self._ingest_one(u, dry_run=dry_run) for u in image_urls]
+                    results = [self._ingest_one(u, uploader=uploader,
+                                               dry_run=dry_run)
+                               for u in image_urls]
                 else:
                     with ThreadPoolExecutor(max_workers=workers,
                                             thread_name_prefix="ingest") as pool:
                         #: `map` 保序 ⇒ fileList 顺序 = 请求顺序（上游按顺序理解垫图语义）
                         results = list(pool.map(
-                            lambda u: self._ingest_one(u, dry_run=dry_run), image_urls))
+                            lambda u: self._ingest_one(u, uploader=uploader,
+                                                       dry_run=dry_run), image_urls))
                 for uploaded, norm_notes, traces in results:
                     for note in norm_notes:
                         self.store.add_degradation(task_id, note)
@@ -675,7 +721,7 @@ class Service:
             raise
 
         # ② 建任务
-        batch_id, trace = self.client.create_image(
+        batch_id, trace = client.create_image(
             model_id=plan["upstream_model"],
             desc=plan.get("desc") or "",
             file_list=file_list,
@@ -703,19 +749,20 @@ class Service:
 
     def poll_many(self, tasks: list[dict[str, Any]], *,
                   dry_run: bool = False) -> dict[str, Any]:
-        """**一次**上游查询推进**全部**在途任务（主路径），窗口外的再**一次** v4 兜底。
+        """推进全部在途任务；**按凭据分组**，每组用各自的客户端查。
 
-        🔴 这是本项目的批量轮询设计：hailuo 的 `my/batch` 端点不带 id 参数
-        （它回"我最近的若干条"）⇒ 一轮 tick 的主路径查询次数与在途任务数**无关**，
-        恒为 1 次。这与 jimeng 的"合并 id 查询"是同一目标、不同手段。
+        🔴 请求数（透传模式下的关键指标）：
+        · 单凭据（绝大多数部署）⇒ 与本项目的批量轮询设计一致：
+          `my/batch` 不带 id（回"我最近的若干条"）⇒ 一轮 tick 主路径**恒 1 次**，
+          窗口外的合并成**一次** v4 点名直查 ⇒ **至多 2 次**，与在途任务数无关；
+        · 多凭据 ⇒ 每个"有在途任务的凭据"各 1 次主查询（+至多 1 次兜底）——
+          这是**无法避免**的：`my/batch` 的语义是"**我**最近的 N 条"，跨账号查不了。
 
-        窗口没覆盖到的任务（例如被账号历史记录挤出"最近 N 条"）**合并成一次**
-        v4 点名直查（`/v4/api/multimodal/video/processing`）——
-        所以一轮 tick 的上游查询**至多 2 次**，仍与在途任务数无关。
+        凭据不在池里（进程重启/过期）⇒ 该组任务以 `CredentialUnavailable`
+        **明确失败**（不静默卡死，也绝不改用别的账号去查）。
         """
         if not tasks:
             return {"polled": 0, "updated": 0}
-        self._require_upstream()
 
         # ---- 起轮宽限：刚提交的任务先别问
         # 🔴 这个旋钮曾经**读了但没用**（`POLL_GRACE` 只被写进配置没人消费）。
@@ -733,13 +780,41 @@ class Service:
             # 全部都在宽限期内 ⇒ 本轮不打上游（**这是一次被省掉的请求**）
             return {"polled": 0, "updated": 0, "deferred": len(deferred)}
 
+        # ---- 按凭据分组（单凭据 ⇒ 只有一组，行为与旧版逐字节一致）
+        groups: dict[str, list[dict[str, Any]]] = {}
+        for task in tasks:
+            groups.setdefault(task.get("credential_id") or "", []).append(task)
+
+        out: dict[str, Any] = {"polled": 0, "updated": 0}
+        for credential, group in groups.items():
+            try:
+                client, _ = self.clients_for(credential)
+            except CredentialUnavailable as e:
+                for task in group:
+                    self._fail_task(task["task_id"], e)
+                out["failed_no_credential"] = out.get("failed_no_credential", 0) + len(group)
+                logger.warning(f"凭据不可用 ⇒ {len(group)} 个任务判失败：{e}")
+                continue
+            res = self._poll_group(group, client=client, dry_run=dry_run)
+            for key, value in res.items():
+                if isinstance(value, int):
+                    out[key] = out.get(key, 0) + value
+                elif key not in out:
+                    out[key] = value
+        if deferred:
+            out["deferred"] = len(deferred)
+        return out
+
+    def _poll_group(self, tasks: list[dict[str, Any]], *, client: HailuoClient,
+                    dry_run: bool = False) -> dict[str, Any]:
+        """**同一凭据**的一组任务：1 次主查询 + 至多 1 次 v4 兜底。"""
         wanted = {t["task_id"]: t for t in tasks}
         batch_ids = {t.get("upstream_batch_id"): t["task_id"]
                      for t in tasks if t.get("upstream_batch_id")}
 
         # 只查图片类型；多取一些，因为我们用的是"我最近 N 条"的语义
         limit = max(30, min(100, len(wanted) * 4))
-        batches, trace = self.client.fetch_batches(
+        batches, trace = client.fetch_batches(
             limit=limit, feed_types=[FEED_TYPE_IMAGE], dry_run=dry_run)
         OBS.upstream("fetch_batches", **trace)
         if dry_run:
@@ -767,7 +842,7 @@ class Service:
             bid_by_task = {tid: bid for bid, tid in batch_ids.items()}
             to_query = [bid_by_task[tid] for tid in missing][:50]
             try:
-                v4_batches, v4_trace = self.client.fetch_by_ids(to_query)
+                v4_batches, v4_trace = client.fetch_by_ids(to_query)
                 OBS.upstream("fetch_by_ids", **v4_trace)
                 fallback["polled"] = len(to_query)
                 for batch_id, feeds in v4_batches:
@@ -788,13 +863,11 @@ class Service:
         still_missing = [tid for tid in batch_ids.values() if tid not in seen]
         if still_missing:
             logger.debug(f"{len(still_missing)} 个任务主窗口与 v4 兜底均未返回，保持非终态等待")
-        out = {"polled": len(tasks), "updated": updated,
-               "missing": len(still_missing), "trace": trace}
+        group_out: dict[str, Any] = {"polled": len(tasks), "updated": updated,
+                                     "missing": len(still_missing), "trace": trace}
         if fallback:
-            out["fallback"] = fallback
-        if deferred:
-            out["deferred"] = len(deferred)
-        return out
+            group_out["fallback"] = fallback
+        return group_out
 
     def _apply_feeds(self, task_id: str, feeds: list[Feed]) -> bool:
         """把上游某个 batch 下的 feeds 应用到本地任务。返回是否推进了终态。
@@ -912,7 +985,8 @@ class Service:
         return {
             "service": self.settings.otel_service_name,
             "upstream_configured": self.settings.upstream_configured,
-            "auth_enabled": self.settings.auth_enabled,
+            "auth": "jwt-passthrough",
+            "credentials": self.credentials.stats(),
             "concurrency_limit": self.settings.hl_concurrency,
             "gate": self.gate.stats(),
             "store": self.store.stats(),

@@ -12,8 +12,12 @@ from app.store import ST_QUEUED
 from .conftest import PNG_1PX
 
 IMG = "https://cdn.hailuoai.video/ref/a.png"
-KEY = {"Authorization": "Bearer sk-test-key"}
-BAD = {"Authorization": "Bearer sk-wrong"}
+from .conftest import FAKE_JWT
+
+#: 合法凭据（合成 JWT：结构合法 + exp 远未来 ⇒ 过本地校验）
+KEY = {"Authorization": f"Bearer {FAKE_JWT}"}
+#: 非法凭据（不是 JWT 形态 —— 透传模式下**只认 JWT**）
+BAD = {"Authorization": "Bearer not-a-jwt"}
 
 
 def _accept(client, body: dict) -> str:
@@ -205,27 +209,22 @@ def test_readyz_ok_when_configured(client) -> None:
     assert r.status_code == 200 and r.json()["status"] == "ready"
 
 
-def test_readyz_503_without_upstream(settings, store) -> None:
-    """"没配凭据"是**部署问题** ⇒ 503（不是 401）。
+def test_readyz_no_longer_gates_on_server_token(settings, store) -> None:
+    """透传模式下 `/readyz` **不再**检查"服务端 token"。
 
-    ⚠️ `/readyz` 读的是 **`Service` 自己的 settings**（单一真相），
-    所以这里必须**造一个真的没 token 的 Service**，
-    而不是拿一个配了 token 的 Service 去配一个空 token 的 Settings —— 那样两处漂移，
-    测出来的是假象。
+    凭据随请求来（服务端本就不持有账号凭据）；"某个调用方 token 是否有效"
+    是上游说了算 —— 探针只该回答"这个进程能不能接活"（库可连）。
     """
     from fastapi.testclient import TestClient
 
     from app.main import create_app
     from app.service import Service
 
-    bare = settings.replace(hailuo_token="")
-    bare.validate()
-    svc = Service(bare, store=store, fetch_capabilities=False)
-    app = create_app(bare, service=svc)
+    svc = Service(settings, store=store, fetch_capabilities=False)
+    app = create_app(settings, service=svc)
     r = TestClient(app).get("/readyz")
-    assert r.status_code == 503
-    assert "HAILUO_TOKEN" in r.json()["reason"]
-
+    assert r.status_code == 200
+    assert r.json()["auth"] == "jwt-passthrough"
 
 def test_stats_exposes_gate_and_capabilities(client) -> None:
     r = client.get("/stats")

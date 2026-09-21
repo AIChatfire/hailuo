@@ -57,8 +57,9 @@ docker compose exec db psql -U hailuo -d hailuo
 
 ```bash
 export TASK_DB='sqlite+pysqlite:///./hailuo.db'
-export HAILUO_TOKEN='<浏览器 localStorage 里的 JWT>'
-export API_KEYS='sk-xxxxxxxx'           # 留空 = 关闭鉴权（仅内网）
+# 鉴权是**透传**：调用方请求里自带 hailuo JWT（见 §2.6），服务端无需任何账号凭据。
+# HAILUO_TOKEN 只在跑 scripts/ 下的运维脚本时才需要（脚本登记它自己的凭据）。
+export HAILUO_TOKEN='<浏览器 localStorage 里的 JWT>'   # 可选：仅脚本用
 gunicorn -c gunicorn_conf.py "app.main:create_app()"
 ```
 
@@ -133,34 +134,40 @@ hailuo 没有回调，只能自己轮询。⇒ 协调器**不是可选增强，�
 4. **`useOriginPrompt` 恒 `true`** = "不要改写我的 prompt"。
    反过来等于让上游偷偷重写调用方的提示词，那是**没被要求的降级**。
 
-### 2.6 鉴权：静态 Bearer Key 白名单
+### 2.6 鉴权：hailuo JWT **透传**（唯一的入口鉴权方式）
 
-`Authorization: Bearer <key>` 与 `API_KEYS`（逗号分隔）做白名单比对。
-没有用户体系、没有令牌签发、没有过期时间 —— 就是一份静态名单。
+`Authorization: Bearer <你的 hailuo 登录 token>` —— 该 token **同时就是上游凭证**：
+建任务、轮询、OSS 上传全程都用它，**费用记在 token 所有者账上**。
+服务端**不持有任何账号凭据**，因此没有"白名单 key"或"服务端账号"这一档
+（2026-09-21 起，且刻意**不做向后兼容**）。
 
-- `API_KEYS` 为空 ⇒ **鉴权整体关闭**，启动会打 WARNING；
-- 通过后 Key 被换成**不可逆指纹** `credential_id = HMAC-SHA256(secret, key)`，
-  `secret` 首次启动随机生成并存在任务库 `meta` 表 ⇒ **明文 Key 永不落库**；
-- 任务与该指纹绑定：换一把 Key 读别人的任务 ⇒ **404，且不发上游请求**（本地拦死）。
+- 本地只校验**结构与 `exp`**（**不验签** —— 没有签名密钥）；
+  伪造/过期 token 由**上游**兜住（401）—— 本地这层只为"早失败、少一次往返"；
+- 通过后 token 被换成**不可逆指纹** `credential_id = HMAC-SHA256(secret, token)`，
+  `secret` 首次启动随机生成并存任务库 `meta` 表 ⇒ **明文 token 永不落库**；
+- 明文 token 仅驻留**进程内存池**（`CredentialPool`，TTL/容量双上限），
+  每个凭据一套客户端与上传缓存（上传资产是账号级的）；
+- 任务与该指纹绑定：换 token 读别人的任务 ⇒ **404，且不发上游请求**（本地拦死）。
 
 **已知弱点（不粉饰）**
 
 | # | 问题 | 影响 |
 |---|---|---|
-| 1 | `key not in api_keys` 是**明文元组的 `in`**，逐元素 `==`，**不是恒定时间比较** | 理论上可按响应时间差逐字节猜 Key。Key 是高熵随机串，实际利用难度大，但正确写法是 `hmac.compare_digest` |
-| 2 | **没有按 Key 的配额/限流** | 闸门是**全局**的；任何一把合法 Key 都能持续消耗额度 |
-| 3 | **轮换 Key 会孤儿化历史任务** | 任务绑定旧指纹，换 Key 后旧任务 404（刻意设计，但运维要知道） |
-| 4 | **鉴权关闭是默认态** | 只有一条启动 WARNING 兜底；`/readyz` 不看它 |
+| 1 | **不验签**：服务无法验证 token 真伪 | 伪造 token 会在上游拿到 401（本服务会把它作为任务失败如实返回）。本地这层只挡"结构/过期"这类明显坏输入 |
+| 2 | **明文凭据在内存**（不落库的必然代价） | 进程被 dump ⇒ 在池 token 可见；进程重启 ⇒ 池清空，在途任务以 `503 credential_unavailable` 明确失败（**绝不回落**到别的账号） |
+| 3 | **没有按凭据的配额/限流** | 闸门是**全局**的；任何合法 token 都能持续消耗**它自己账号**的额度 |
+| 4 | **多凭据 ⇒ 轮询请求数按凭据数增长** | `my/batch` 的语义是"我最近的 N 条" ⇒ 每个有在途任务的凭据一轮各 1 次查询（单凭据部署与本设计早期完全一致：恒 1 次） |
 | 5 | 无 IP 白名单 / 无 mTLS / 无审计日志（只有一行请求摘要） | — |
 
-⇒ 生产部署建议：**必须设 `API_KEYS`**，并在网关层再叠一层鉴权与限流。
+⇒ 生产部署建议：在网关层再叠一层鉴权与限流；把 `CredentialPool` 的容量当**内存预算**看。
 
 ### 2.7 不制造假能力
 
 - **视频链路不注册**：上游模型信息端点一并返回 24 个 `videoModels`，
   但视频链路未取证 ⇒ 不出现在 `/async/v1/models`（见 `models.DELIBERATE_ABSENCES`）；
-- 未配凭据时 `POST` 回 **503** 而不是假装受理；
-- 上游凭据失效也是 **503**（部署问题），不是 401（调用方的问题）；
+- 入口凭据不合法 ⇒ **401**（调用方的问题，说明为什么：结构/过期）；
+- 任务凭据不在内存池（重启/过期）⇒ **503 `credential_unavailable`** 并**明确**
+  告诉调用方"同 token 重提"——不是 401（那次请求当时合法），也不静默换账号；
 - **查不到单价就不给 `forecast_credits`** —— 编一个数字等于说谎。
 
 ---
@@ -169,13 +176,13 @@ hailuo 没有回调，只能自己轮询。⇒ 协调器**不是可选增强，�
 
 ```bash
 curl -s -X POST localhost:8300/async/v1/images/generations \
-  -H 'Authorization: Bearer sk-xxxxxxxx' -H 'Content-Type: application/json' \
+  -H 'Authorization: Bearer <你的 hailuo token>' -H 'Content-Type: application/json' \
   -d '{"model":"hailuo-i2i","prompt":"把背景换成雪山，保留人物光影",
        "image":["https://…/ref.png"],"size":"4096x4096"}'
 # → {"task_id":"hailuo_…"}
 
 curl -s localhost:8300/async/v1/images/generations/hailuo_… \
-  -H 'Authorization: Bearer sk-xxxxxxxx'
+  -H 'Authorization: Bearer <你的 hailuo token>'
 # → 非终态：202 {"task_id":"…","status":"in_progress"}
 # → 成功  ：200 {"data":[{"url":"https://cdn.hailuoai.video/…png"}],
 #                "created":1789923012,"usage":{"images":1,"forecast_credits":8}}

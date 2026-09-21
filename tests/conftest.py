@@ -70,6 +70,22 @@ def _make_png(width: int = 1, height: int = 1, *, noise: bool = False) -> bytes:
 
 
 #: 1×1 红色 PNG（真字节，能过魔数嗅探与 Pillow）
+#: 🧪 合成 JWT（透传鉴权用）：结构合法 + `exp` 远未来 ⇒ 过本地校验。
+#: ⚠️ 它**不是**真 token：测试全程零出网，任何真实调用都不可能发生。
+FAKE_JWT = (
+    "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9."
+    "eyJleHAiOjQxMDI0NDQ4MDAsInVzZXIiOnsiaWQiOiIxMDAwMDAwMDAwMDAwMDAwMDEiLCJuYW1lIjoi"
+    "dGVzdC11c2VyIiwiZGV2aWNlSUQiOiIxMDAwMDAwMDAwMDAwMDAwMDAifX0."
+    "ZmFrZS1zaWduYXR1cmUtZm9yLXRlc3Rz"
+)
+#: 第二个凭据（断言"按凭据路由"用：两条任务应带各自的 token 出站）
+FAKE_JWT_B = (
+    "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9."
+    "eyJleHAiOjQxMDI0NDQ4MDAsInVzZXIiOnsiaWQiOiIxMDAwMDAwMDAwMDAwMDAwMDIiLCJuYW1lIjoi"
+    "dGVzdC11c2VyLWIiLCJkZXZpY2VJRCI6IjEwMDAwMDAwMDAwMDAwMDAwMSJ9fQ."
+    "ZmFrZS1zaWduYXR1cmUtYi1mb3ItdGVzdHM"
+)
+
 PNG_1PX = _make_png()
 
 
@@ -115,6 +131,8 @@ class FakeHailuo:
         self.v4_batches: dict[str, dict[str, Any]] = {}
         #: 输入图 URL -> 字节
         self.images: dict[str, bytes] = {}
+        #: 🔴 每次请求携带的 `token` 头（透传路由断言：两条任务须带各自的 token）
+        self.tokens_seen: list[str] = []
         #: 强制某个端点返回错误信封
         self.force_error: dict[str, httpx.Response] = {}
         #: 🔴 itertools.count 线程安全 —— 并行 ingest 时 callback/create 并发到达
@@ -154,6 +172,7 @@ class FakeHailuo:
     # ------------------------------------------------------------------ 路由
 
     def handler(self, request: httpx.Request) -> httpx.Response:
+        self.tokens_seen.append(request.headers.get("token", ""))
         path = request.url.path
 
         if path in self.force_error:
@@ -338,7 +357,6 @@ def settings(tmp_path: Any) -> Settings:
     st = Settings(
         hailuo_token="fake-token-for-tests",
         task_db=f"sqlite+pysqlite:///{tmp_path}/test.db",
-        api_keys=("sk-test-key",),
         coordinator_enabled=False,   # 测试直接调 tick()，不起线程
         #: 轮询间隔/租约必须是正数（`validate()` 会拦 0）—— 取极小值让测试瞬时完成
         hailuo_poll_interval=0.01,
@@ -371,6 +389,8 @@ def service(settings: Settings, store: TaskStore, fake: FakeHailuo) -> Service:
                   fetch_capabilities=False, http_transport=fake.transport())
     # 能力表：喂假上游读到的数据（等价于运行期实读）
     svc.refresh_capabilities()
+    #: 透传凭据：API 测试默认发 `Bearer FAKE_JWT`（入口鉴权会再登记一次，幂等）
+    svc.register_credential(FAKE_JWT)
     return svc
 
 

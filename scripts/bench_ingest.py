@@ -84,24 +84,28 @@ def fresh_service(*, parallelism: int):
         ingest_parallelism=parallelism,
         coordinator_enabled=False,
     )
-    return Service(st, fetch_capabilities=False)
+    svc = Service(st, fetch_capabilities=False)
+    return svc
 
 
 def one_round(parallelism: int, urls: list[str]) -> tuple[float | None, list[float], str]:
     """跑一轮 ingest。返回 `(总耗时|None, [每张耗时], 错误说明)`。单轮失败不中断基准。"""
     svc = fresh_service(parallelism=parallelism)
+    #: 透传鉴权：登记运维凭据并取它的 uploader（上传资产是账号级的）
+    fp = svc.register_credential(svc.settings.hailuo_token)
+    _client, uploader = svc.clients_for(fp)
     per_image: list[float] = []
     try:
         t0 = time.perf_counter()
         if parallelism == 1:
             for u in urls:
                 s = time.perf_counter()
-                svc._ingest_one(u)  # noqa: SLF001 —— 脚本层直接量流水线
+                svc._ingest_one(u, uploader=uploader)  # noqa: SLF001
                 per_image.append(time.perf_counter() - s)
         else:
             def timed(u: str) -> float:
                 s = time.perf_counter()
-                svc._ingest_one(u)  # noqa: SLF001
+                svc._ingest_one(u, uploader=uploader)  # noqa: SLF001
                 return time.perf_counter() - s
 
             with ThreadPoolExecutor(max_workers=parallelism,

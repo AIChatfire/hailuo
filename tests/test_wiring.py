@@ -124,7 +124,7 @@ def test_every_setting_knob_is_actually_read() -> None:
     这里守的是"这个名字是否在 app/ 里出现过"。
     """
     source = _read_source()
-    derived = {"startup_warnings", "db_target", "is_sqlite", "auth_enabled",
+    derived = {"startup_warnings", "db_target", "is_sqlite",
                "upstream_configured"}
     unread: list[str] = []
     for f in dataclasses.fields(Settings):
@@ -171,11 +171,13 @@ def test_lease_must_cover_two_polls() -> None:
 
 
 def test_startup_warnings_flag_unsafe_defaults() -> None:
-    st = Settings(task_db=":memory:", hailuo_token="", api_keys=(), hl_concurrency=8)
+    st = Settings(task_db=":memory:", hailuo_token="", hl_concurrency=8)
     st.validate()
     joined = " ".join(st.startup_warnings)
-    assert "API_KEYS 为空" in joined
-    assert "HAILUO_TOKEN 未配置" in joined
+    #: 透传模式下**不存在**"鉴权关闭"这一档（Bearer 必须是 hailuo JWT）⇒
+    #: 告警里不再有 API_KEYS；只提醒"脚本/嵌入模式需要 HAILUO_TOKEN"。
+    assert "API_KEYS" not in joined
+    assert "透传" in joined and "脚本" in joined
     assert "HL_CONCURRENCY=8" in joined
 
 

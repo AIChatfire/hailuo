@@ -65,9 +65,9 @@ jobs:
     runs-on: ubuntu-latest
     env:
       COORDINATOR_ENABLED: "0"
+      SMOKE_JWT: "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJleHAiOjQxMDI0NDQ4MDAsInVzZXIiOnsiaWQiOiIxMDAwIiwibmFtZSI6ImNpLXNtb2tlIiwiZGV2aWNlSUQiOiIxMDAwMDAwMDAwMDAwMDAwMDAifX0.Y2ktc21va2Utc2ln"
       HAILUO_TOKEN: "smoke-test-not-a-real-token"
       TASK_DB: "sqlite+pysqlite:///./smoke.db"
-      API_KEYS: "sk-smoke"
       PORT: "8300"
     steps:
       - uses: actions/checkout@v4
@@ -86,7 +86,7 @@ jobs:
           curl -sf http://127.0.0.1:8300/async/v1/models | head -c 200
           # 受理必须只回一个 task_id（协调器关 ⇒ 零上游往返）
           curl -s -X POST http://127.0.0.1:8300/async/v1/images/generations \
-            -H 'Authorization: Bearer sk-smoke' -H 'Content-Type: application/json' \
+            -H "Authorization: Bearer $SMOKE_JWT" -H 'Content-Type: application/json' \
             -d '{"model":"hailuo-i2i","prompt":"smoke","image":["https://example.com/a.png"]}' \
             | tee /tmp/accept.json
           python -c "import json;d=json.load(open('/tmp/accept.json'));assert set(d)=={'task_id'},d"
