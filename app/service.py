@@ -1,0 +1,1039 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""编排层：受理 / 计划 / 提交 / 轮询 / **响应构造**。
+
+## 受理不碰上游
+
+`create()` **只做三件事**：校验 → 翻译成"计划" → 落库。请求内**零上游往返**。
+
+理由：建任务是**计费动作**，必须受节奏闸门约束、要能重试、要能防重复提交 ——
+这些都是后台协调器的职责，不是 HTTP 请求的职责。
+输入图下载/上传同理，放后台 ⇒ 网络抖动体现为任务 `failure`（附原因），
+而不是让受理请求跟着上游一起抖。
+
+## 翻译层（`build_plan`）—— 本项目最该被测试覆盖的地方
+
+**纯函数**，不碰网络、不碰库。它只做一件事：
+把 OpenAI 形态的请求翻成 hailuo `parameter` 结构，并把**每一处"请求了 A、实际做了 B"**
+写进 `degradations`。
+
+### 图生图（重点）的四条适配规则
+
+1. **`fileList` 顺序 = 请求顺序**（上游按顺序理解垫图语义，实测抓包里 `fileList` 就是有序数组）；
+2. **张数上限按"所选模型自己声明的" `maxSupportImageCount` 校验**
+   （`gpt-image-1.5` 只有 3，`nano_banana*` 是 14，`gpt-image-2*` 是 16）——
+   **超了就 400，绝不"收下 N 张只用第 1 张"**；
+3. **`referenceMode` 默认不发** —— 抓包的 i2i 请求里 `imageParameter` **没有**这个键，
+   只有显式指定时才带上（`extend` 是"扩图"，勿默认）；
+4. **`useOriginPrompt` 默认 `True`** —— 即"不要改写我的 prompt"。
+   反过来（`False`）等于让上游偷偷重写调用方的提示词，那是**没被要求的降级**。
+
+## `view()` 是唯一出口
+
+所有响应形状只在这里产出。改形状 = 改这里 + 改 `docs/INTERFACE.md` + 改 `tests/test_api.py`。
+"""
+from __future__ import annotations
+
+import hashlib
+import hmac
+import json
+import re
+import time
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass, field
+from typing import Any
+
+from loguru import logger
+
+from . import media, models
+from .config import Settings
+from .errors import (
+    AdapterError,
+    CapabilityUnavailable,
+    InvalidParameterError,
+    TaskNotDeletable,
+    TaskNotFoundError,
+    UpstreamNotConfigured,
+)
+from .gate import Gate, build as build_gate
+from .observability import OBS
+from .store import (
+    ST_FAILURE,
+    ST_IN_PROGRESS,
+    ST_QUEUED,
+    ST_SUCCEEDED,
+    TERMINAL,
+    TaskStore,
+    new_task_id,
+)
+from .upstream.hailuo import capabilities as caps
+from .upstream.hailuo import upload as up
+from .upstream.hailuo.client import (
+    FEED_TYPE_IMAGE,
+    Feed,
+    HailuoClient,
+    status_name,
+)
+
+# ---------------------------------------------------------------------------
+# 计划
+# ---------------------------------------------------------------------------
+
+_RATIO_RE = re.compile(r"^(\d{1,3}):(\d{1,3})$")
+_SIZE_RE = re.compile(r"^(\d{2,5})\s*[x×*]\s*(\d{2,5})$")
+
+#: 长边 → resolution 档。**这是本服务自己的口径**（上游只认 1K/2K/4K 这类枚举），
+#: 所以每次映射都进 `degradations`。
+_RES_BY_MAX_SIDE: tuple[tuple[int, str], ...] = ((1536, "1K"), (2560, "2K"))
+
+
+def _ratio_value(text: str) -> float | None:
+    m = _RATIO_RE.match(text.strip())
+    if not m:
+        return None
+    w, h = int(m.group(1)), int(m.group(2))
+    return (w / h) if h else None
+
+
+def _resolution_from_size(width: int, height: int) -> str:
+    max_side = max(width, height)
+    for bound, label in _RES_BY_MAX_SIDE:
+        if max_side <= bound:
+            return label
+    return "4K"
+
+
+@dataclass
+class Plan:
+    """一次生成任务在**上游侧**的完整形态。"""
+
+    capability: str
+    upstream_model: str
+    desc: str
+    image_urls: list[str] = field(default_factory=list)
+    quantity: int = 1
+    aspect_ratio: str | None = None
+    resolution: str | None = None
+    quality: str | None = None
+    reference_mode: str | None = None
+    use_origin_prompt: bool = True
+    degradations: list[str] = field(default_factory=list)
+    #: 预估积分（来自上游计价表，**只是预估**）
+    forecast_credits: float | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "capability": self.capability,
+            "upstream_model": self.upstream_model,
+            "desc": self.desc,
+            "image_urls": list(self.image_urls),
+            "quantity": self.quantity,
+            "aspect_ratio": self.aspect_ratio,
+            "resolution": self.resolution,
+            "quality": self.quality,
+            "reference_mode": self.reference_mode,
+            "use_origin_prompt": self.use_origin_prompt,
+            "degradations": list(self.degradations),
+            "forecast_credits": self.forecast_credits,
+        }
+
+    def prompt_struct(self) -> str:
+        """上游 `promptStruct` —— 富文本结构。
+
+        抓包回显的形态（t2i「a cat」）：
+
+        ```json
+        {"value":[{"type":"paragraph","children":[{"text":"a cat"}]}],
+         "length":5,"plainLength":5,"rawLength":5}
+        ```
+
+        ⚠️ 本服务**只造单段落**结构：调用方给的是纯文本，把它拆成多段落
+        是我们**没有依据**的加工。三个长度字段都取纯文本长度（与抓包一致）。
+        """
+        return json.dumps({
+            "value": [{"type": "paragraph", "children": [{"text": self.desc}]}],
+            "length": len(self.desc),
+            "plainLength": len(self.desc),
+            "rawLength": len(self.desc),
+        }, ensure_ascii=False)
+
+
+# ---------------------------------------------------------------------------
+# 认可的"上游没有"字段 —— 进 degradations，不报错
+# ---------------------------------------------------------------------------
+
+KNOWN_UNSUPPORTED: dict[str, str] = {
+    "watermark": "上游图片链路没有水印开关（产物本身就带不带水印两版直链）",
+    "response_format": "上游恒回 URL（不回 b64_json）",
+    "style": "上游没有 style 维度（画面风格请写进 prompt）",
+    "stream": "本服务是两段式异步接口，没有流式",
+    "user": "上游没有 user 维度",
+    "sequential_image_generation": "上游没有连续生成概念",
+    "max_images": "上游张数由 quantity 决定（见 n 的语义）",
+    "background": "上游没有 background 维度",
+    "output_format": "上游产物格式由模型决定",
+    "moderation": "上游审核策略不可配",
+}
+
+
+# ---------------------------------------------------------------------------
+# 服务
+# ---------------------------------------------------------------------------
+
+
+class Service:
+    """编排层。持有 store / client / uploader / gate，是唯一改任务状态的地方。"""
+
+    def __init__(
+        self,
+        settings: Settings,
+        *,
+        store: TaskStore | None = None,
+        client: HailuoClient | None = None,
+        uploader: up.Uploader | None = None,
+        fetch_capabilities: bool = True,
+        http_transport: Any = None,
+    ) -> None:
+        self.settings = settings
+        self.store = store or TaskStore(
+            settings.db_target, pool_size=settings.task_db_pool_size,
+            max_overflow=settings.task_db_max_overflow,
+            pool_recycle=settings.task_db_pool_recycle,
+            pre_ping=settings.task_db_pool_pre_ping,
+            connect_timeout=settings.task_db_connect_timeout,
+        )
+        self.gate: Gate = build_gate(settings)
+        self._client = client
+        self._uploader = uploader
+        #: 本服务自建 httpx 客户端时统一用它（输入图下载 + 能力表读取）
+        #: —— **测试靠它做到零出网**。为 `None` 时走真实网络。
+        self._http_transport = http_transport
+        self._caps_degradations: list[str] = []
+        self._caps_refreshed_at: float = 0.0
+        #: 指纹密钥：让**明文 Key 永不落库**
+        self._secret = self.store.fingerprint_secret()
+        if fetch_capabilities:
+            self.refresh_capabilities()
+
+    # ------------------------------------------------------------------ 依赖
+
+    @property
+    def client(self) -> HailuoClient:
+        """惰性建上游客户端（未配 token 时不建 —— 让 `/healthz` 零依赖）。"""
+        if self._client is None:
+            self._client = HailuoClient(
+                token=self.settings.hailuo_token,
+                base_url=self.settings.hailuo_base_url,
+                device=self.settings.device_profile(),
+            )
+        return self._client
+
+    @property
+    def uploader(self) -> up.Uploader:
+        if self._uploader is None:
+            self._uploader = up.Uploader(client=self.client,
+                                         cache_ttl=self.settings.upload_cache_ttl)
+        return self._uploader
+
+    def close(self) -> None:
+        for name, obj in (("uploader", self._uploader), ("client", self._client)):
+            if obj is None:
+                continue
+            try:
+                obj.close()
+            except Exception as e:  # noqa: BLE001
+                # 关闭失败不该影响进程退出，但**必须留痕** ——
+                # 否则"连接关不掉"这件事在任何地方都看不见。
+                logger.debug(f"{name} 关闭失败（已忽略）：{type(e).__name__}: {e}")
+        self.store.close()
+
+    def _require_upstream(self) -> None:
+        if not self.settings.upstream_configured:
+            raise UpstreamNotConfigured(
+                "服务未配置 HAILUO_TOKEN —— 这是**部署问题**："
+                "请联系部署方配置 hailuo 的登录 token。")
+
+    # ------------------------------------------------------------------ 公开访问器
+    # 这两条存在的理由：协调器与 `/capabilities` 路由都要读它们。
+    # 让外部去摸 `service._uploader` / `service._caps_degradations` 是跨层访问私有成员
+    # —— 静态门禁（SLF001）会拦，而且那种耦合在重构时会静默断掉。
+
+    @property
+    def capability_degradations(self) -> list[str]:
+        '''能力表的降级说明（读不到时退回冻结快照的原因）。**只读副本。**'''
+        return list(self._caps_degradations)
+
+    def purge_upload_cache(self) -> int:
+        '''清理过期的上传缓存。返回清掉的条数（没有 uploader 时返回 0）。'''
+        if self._uploader is None:
+            return 0
+        return self._uploader.purge_expired()
+
+    # ------------------------------------------------------------------ 能力表
+
+    def refresh_capabilities(self) -> list[str]:
+        """运行期实读上游能力表（**零计费**）。读不到 ⇒ 退回冻结快照 + 留痕。"""
+        if not self.settings.upstream_configured:
+            self._caps_degradations = []
+            return []
+        try:
+            #: 🔴 **刻意惰性导入**：`/healthz` 必须零依赖（容器每 30s 打它），
+            #: 所以 httpx 只在这条真的要用它的路径上才加载。
+            import httpx  # noqa: PLC0415
+
+            with httpx.Client(base_url=self.settings.hailuo_base_url, timeout=12.0,
+                              transport=self._http_transport) as c:
+                found, notes = _sync_fetch_models(c)
+            if found:
+                models.install_runtime_models(found)
+                OBS.event("capabilities.loaded", coverage=caps.coverage(found))
+            self._caps_degradations = notes
+            self._caps_refreshed_at = time.time()
+            return notes
+        except Exception as e:  # noqa: BLE001
+            note = (f"上游能力表整体读取失败（{type(e).__name__}: {e}）⇒ "
+                    f"退回 {models.SNAPSHOT_DATE} 的冻结快照（{len(models.FROZEN_SNAPSHOT)} 个模型）。")
+            logger.warning(note)
+            self._caps_degradations = [note]
+            return [note]
+
+    # ------------------------------------------------------------------ 凭据
+
+    def credential_of(self, key: str | None) -> str:
+        """API Key → **不可逆指纹**。明文 Key 绝不落库、绝不进日志。"""
+        material = (key or "anonymous").encode("utf-8")
+        return hmac.new(self._secret.encode("utf-8"), material,
+                        hashlib.sha256).hexdigest()[:32]
+
+    # ------------------------------------------------------------------ 受理
+
+    def create(self, body: dict[str, Any], *, credential: str) -> dict[str, Any]:
+        """受理一次生成。**只落库，零上游往返。**"""
+        request = dict(body or {})
+        plan, capability, upstream_model = self.build_plan(request)
+
+        rec = self.store.create_task(
+            task_id=new_task_id(),
+            credential_id=credential,
+            capability=capability,
+            model=str(request.get("model") or ""),
+            upstream_model=upstream_model,
+            status=ST_QUEUED,
+            request_json=json.dumps(request, ensure_ascii=False),
+            plan_json=json.dumps(plan.to_dict(), ensure_ascii=False),
+            degradations_json=json.dumps(plan.degradations, ensure_ascii=False),
+        )
+        OBS.event("task.accepted", task_id=rec["task_id"], capability=capability,
+                  upstream_model=upstream_model, quantity=plan.quantity,
+                  n_images=len(plan.image_urls))
+        logger.bind(task_id=rec["task_id"], capability=capability).info(
+            f"已受理：{capability} model={upstream_model} "
+            f"n={plan.quantity} images={len(plan.image_urls)}")
+        return rec
+
+    # ------------------------------------------------------------------ 翻译层
+
+    def build_plan(self, request: dict[str, Any]) -> tuple[Plan, str, str]:
+        """把请求翻译成 `Plan`。返回 `(plan, capability, upstream_model)`。
+
+        **纯函数**（只读 `request` 与全局能力表）—— 因此可以在毫秒内被测试穷举，
+        而它正是"翻译层"的全部。任何会改变花费的取舍都必须写进 `degradations`。
+        """
+        degradations: list[str] = []
+
+        # ---- 未知字段：区分"上游没有"与"你写错了"
+        known = {"model", "prompt", "image", "size", "n", "seed", "negative_prompt",
+                 "resolution", "aspect_ratio", "quality", "reference_mode"}
+        for key in request:
+            if key in known:
+                continue
+            if key in KNOWN_UNSUPPORTED:
+                degradations.append(
+                    f"参数 {key}={request[key]!r} 本服务**不转发**（{KNOWN_UNSUPPORTED[key]}），"
+                    f"已忽略；不要按它的语义预期结果。")
+                continue
+            raise InvalidParameterError(
+                f"未知参数 {key!r}。本服务接受的字段：{', '.join(sorted(known))}。",
+                param=key)
+
+        # ---- 输入图
+        image_urls = media.accept_form(request.get("image"))
+
+        # ---- 能力
+        capability, resolve_notes = models.resolve_capability(
+            request.get("model"), has_image=bool(image_urls))
+        degradations += resolve_notes
+        cap = models.capability(capability)
+        assert cap is not None  # resolve_capability 只回已知能力
+
+        # ---- 上游模型
+        raw_model = str(request.get("model") or "").strip()
+        raw_model = models.canonical_model_id(raw_model)  # 别名 → 规范 modelID（零说明）
+        available = {m.model_id: m for m in models.all_models()}
+        if raw_model and raw_model in available:
+            # 调用方直接给了上游 modelID（精确匹配，**不做小写化**）
+            upstream_model = raw_model
+        else:
+            # 空 / 占位名 / 能力名 ⇒ 落默认模型，并**说清楚**
+            upstream_model = models.DEFAULT_MODEL
+            if models.DEFAULT_MODEL not in available:
+                raise CapabilityUnavailable(
+                    f"默认模型 {models.DEFAULT_MODEL} 不在当前能力表里 —— "
+                    f"能力表可能读坏或上游已下线该模型。请显式传 model。")
+            degradations.append(
+                f"未指定上游模型（model={raw_model or '（空）'!r}，能力 {capability}）"
+                f"⇒ 使用默认 {upstream_model}。"
+                f"如需指定请传 model=nano_banana21_flash / nano-banana2 / "
+                f"seedream-5.0 / gpt-image-2 等已登记模型。")
+        model_meta = available.get(upstream_model)
+        if model_meta is None:
+            raise InvalidParameterError(
+                f"上游模型 {upstream_model} 不在能力表里（能力表来源："
+                f"{'运行期实读' if models.runtime_models() else '冻结快照'}）。",
+                param="model")
+
+        #: 🔴 **参考图模式不匹配 ⇒ 本地明确拒绝**（2026-09-21 实测驱动）。
+        #: `common_config` 给每个模型声明了 `mode`：本服务实现的是
+        #: `image-reference`（图片参考/编辑，fileList 语义）；
+        #: `subject-reference`（主体参考，如 image-01）需要另一套机制 ——
+        #: 带参考图打过去会被上游用 `code 2400052` 拒掉。让调用方**在上传之前**
+        #: 就拿到可执行的 400，而不是撞一个没有解释的上游码。
+        if image_urls and (getattr(model_meta, "mode", "") or "") != "image-reference":
+            raise InvalidParameterError(
+                f"模型 {upstream_model} 的参考图模式是 "
+                f"{(getattr(model_meta, 'mode', None) or '未声明')!r}（主体参考），"
+                f"本服务当前只实现 'image-reference'（图片参考/编辑）—— "
+                f"带 image 会 100% 被上游拒。请换用 nano_banana21_flash / "
+                f"nano-banana2 / gpt-image-2 等声明 image-reference 的模型，"
+                f"或去掉 image 走文生图。",
+                param="model")
+
+        # ---- prompt
+        prompt = request.get("prompt")
+        prompt = "" if prompt is None else str(prompt)
+        if cap.requires_prompt and not prompt.strip():
+            raise InvalidParameterError(
+                f"{capability} 需要 prompt（提示词）。", param="prompt")
+        if prompt and model_meta.max_prompt_length \
+                and len(prompt) > model_meta.max_prompt_length:
+            raise InvalidParameterError(
+                f"prompt 长度 {len(prompt)} 超过模型 {upstream_model} 声明的上限 "
+                f"{model_meta.max_prompt_length}（上游 maxPromptLength）。", param="prompt")
+
+        # ---- 张数（图片端点的 n）
+        quantity = self._resolve_quantity(request.get("n"), degradations)
+
+        # ---- 输入图张数：**按所选模型自己声明的上界**
+        limit = model_meta.max_support_image_count
+        if image_urls:
+            if not cap.requires_image:
+                degradations.append(
+                    f"{capability} 不接受输入图 ⇒ image 被忽略"
+                    f"（请改用 hailuo-i2i）。")
+                image_urls = []
+            elif limit is not None and len(image_urls) > limit:
+                raise InvalidParameterError(
+                    f"模型 {upstream_model} 声明最多接受 {limit} 张输入图"
+                    f"（上游 maxSupportImageCount），请求给了 {len(image_urls)} 张。"
+                    f"请减少张数，或换一个上限更高的模型"
+                    f"（如 nano_banana21_flash / gpt-image-2 上限 14/16）。",
+                    param="image")
+            elif len(image_urls) > 4:
+                degradations.append(
+                    f"本次带 {len(image_urls)} 张垫图（模型上限 {limit}）—— "
+                    f"上游对多图的实际语义未逐一取证，顺序按请求顺序传递。")
+        elif cap.requires_image:
+            raise InvalidParameterError(
+                f"{capability} 需要至少 1 张输入图（这就是图生图）。"
+                f"文生图请用 hailuo-t2i 或留空 model。", param="image")
+
+        # ---- (resolution, quality)
+        resolution, quality, ratio_notes, ratio = self._resolve_size(
+            request, model_meta, degradations)
+        degradations += ratio_notes
+
+        # ---- referenceMode（**默认不发**）
+        reference_mode = request.get("reference_mode")
+        if reference_mode is not None:
+            reference_mode = str(reference_mode)
+            if reference_mode not in models.REFERENCE_MODES:
+                raise InvalidParameterError(
+                    f"reference_mode={reference_mode!r} 不在已知取值 "
+                    f"{sorted(models.REFERENCE_MODES)} 内。", param="reference_mode")
+        if reference_mode is None and image_urls:
+            degradations.append(
+                "未指定 reference_mode ⇒ 不发送该字段（与抓包一致；"
+                "上游按模型默认的 image-reference 处理参考图）。")
+
+        forecast = model_meta.cost_for(resolution or "", quality) \
+            if (resolution or quality) else model_meta.default_cost
+
+        plan = Plan(
+            capability=capability,
+            upstream_model=upstream_model,
+            desc=prompt,
+            image_urls=image_urls,
+            quantity=quantity,
+            aspect_ratio=ratio,
+            resolution=resolution,
+            quality=quality,
+            reference_mode=reference_mode,
+            use_origin_prompt=True,
+            degradations=degradations,
+            forecast_credits=forecast,
+        )
+        return plan, capability, upstream_model
+
+    # ------------------------------------------------------------------ 翻译辅助
+
+    @staticmethod
+    def _resolve_quantity(raw: Any, degradations: list[str]) -> int:
+        """`n`（出图张数）。**默认 1**，上界 10。
+
+        ⚠️ 不采用上游的 `defaultSelect` 张数 —— 默认必须是**最省**的那个，
+        否则调用方会按"1 张"的预期收到多张的账单。
+        """
+        if raw is None:
+            return 1
+        if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+            raise InvalidParameterError(f"n 必须是整数，实得 {raw!r}。", param="n")
+        n = int(raw)
+        if n < 1:
+            raise InvalidParameterError(f"n 必须 >= 1，实得 {n}。", param="n")
+        if n > 10:
+            degradations.append(f"请求 n={n} 超过本服务上限 10 ⇒ 已按 10 处理。")
+            return 10
+        return n
+
+    @staticmethod
+    def _resolve_size(
+        request: dict[str, Any], model_meta: models.UpstreamModel,
+        degradations: list[str],
+    ) -> tuple[str | None, str | None, list[str], str | None]:
+        """`size` / `resolution` / `aspect_ratio` → `(resolution, quality, 说明, aspect_ratio)`。
+
+        三种输入形态，按优先级：
+          1. **原生的 `resolution` + `aspect_ratio`** —— 直接按模型声明的枚举校验（最忠实）；
+          2. **`size: "WxH"`** —— 换算：长边定 resolution 档，宽高比**吸附**到该模型支持的最接近比例；
+          3. 都没给 —— 用模型声明的 `defaultSelect`（通常是 **Auto**，即跟随参考图比例）。
+
+        🔴 **换算与吸附一定留痕**：`size` 不是上游的概念，
+        "4096x4096 ⇒ 4K + 1:1" 是本服务的口径，调用方必须知道。
+        """
+        notes: list[str] = []
+        resolution = request.get("resolution")
+        ratio = request.get("aspect_ratio")
+        quality = request.get("quality")
+        size = request.get("size")
+
+        if resolution is not None:
+            resolution = str(resolution)
+            if model_meta.resolutions and resolution not in model_meta.resolutions:
+                raise InvalidParameterError(
+                    f"resolution={resolution!r} 不被 {model_meta.model_id} 支持，"
+                    f"可选：{list(model_meta.resolutions)}。", param="resolution")
+            if not model_meta.resolutions:
+                notes.append(
+                    f"模型 {model_meta.model_id} 未声明 resolution 档位 ⇒ "
+                    f"resolution={resolution!r} 不予转发。")
+                resolution = None
+
+        if ratio is not None:
+            ratio = str(ratio)
+            if model_meta.aspect_ratios and ratio not in model_meta.aspect_ratios:
+                raise InvalidParameterError(
+                    f"aspect_ratio={ratio!r} 不被 {model_meta.model_id} 支持，"
+                    f"可选：{list(model_meta.aspect_ratios)}。", param="aspect_ratio")
+
+        if quality is not None:
+            quality = str(quality).lower()
+            supported = {q for row in model_meta.costs for q in (row.get("qualities") or [])}
+            if supported and quality not in supported:
+                raise InvalidParameterError(
+                    f"quality={quality!r} 不被 {model_meta.model_id} 支持，"
+                    f"可选：{sorted(supported)}。", param="quality")
+            if not supported:
+                notes.append(f"模型 {model_meta.model_id} 没有 quality 维度 ⇒ 已忽略 quality。")
+                quality = None
+
+        if size is not None:
+            m = _SIZE_RE.match(str(size).strip())
+            if not m:
+                raise InvalidParameterError(
+                    f'size 必须形如 "2048x2048"，实得 {size!r}。', param="size")
+            width, height = int(m.group(1)), int(m.group(2))
+            derived_res = _resolution_from_size(width, height)
+            if model_meta.resolutions:
+                resolution = derived_res if derived_res in model_meta.resolutions else \
+                    _nearest(resolution_options=model_meta.resolutions, target=derived_res)
+                notes.append(
+                    f"size={width}x{height} ⇒ resolution={resolution}"
+                    f"（本服务按长边 {max(width, height)} 换算；上游只认 "
+                    f"{list(model_meta.resolutions)} 这类档位）。")
+            else:
+                notes.append(
+                    f"模型 {model_meta.model_id} 未声明 resolution 档位 ⇒ "
+                    f"size 只用于推比例，档位不转发。")
+            if model_meta.aspect_ratios:
+                exact = next((r for r in model_meta.aspect_ratios
+                              if _ratio_value(r) is not None
+                              and abs(_ratio_value(r) - width / height) < 1e-9), None)
+                snapped = exact or _snap_ratio(width / height, model_meta.aspect_ratios)
+                if snapped:
+                    ratio = snapped
+                    if exact:
+                        # 正好就是该模型支持的档位 —— 别把"精确对应"说成"吸附"，
+                        # 那会让人以为自己给的比例被改了。
+                        notes.append(
+                            f"size={width}x{height} 正好对应 aspect_ratio={snapped}。")
+                    else:
+                        notes.append(
+                            f"size={width}x{height} 的宽高比 {width / height:.4f} ⇒ "
+                            f"**吸附**到 aspect_ratio={snapped}"
+                            f"（该模型支持的档位：{list(model_meta.aspect_ratios)}）。")
+            else:
+                notes.append(f"模型 {model_meta.model_id} 未声明比例档位 ⇒ 比例不转发。")
+
+        if resolution is None and model_meta.default_resolutions:
+            resolution = model_meta.default_resolutions[0]
+            notes.append(
+                f"未指定 resolution ⇒ 用上游默认档 {resolution}"
+                f"（defaultSelect={list(model_meta.default_resolutions)}）。")
+        if ratio is None and model_meta.default_aspect_ratios:
+            ratio = model_meta.default_aspect_ratios[0]
+            notes.append(
+                f"未指定 aspect_ratio ⇒ 用上游默认档 {ratio}"
+                f"（defaultSelect={list(model_meta.default_aspect_ratios)}）。")
+
+        return resolution, quality, notes, ratio
+
+    # ------------------------------------------------------------------ 提交
+
+    def _ingest_one(self, url: str, *, dry_run: bool = False) -> tuple[Any, list[str], list[dict[str, Any]]]:
+        """单张输入图的完整流水线：**取源**（http(s) 下载 或 data: base64 解码）
+        → 归一化 → 上传。
+
+        张与张相互独立 ⇒ 线程池里并行跑；异常原样上抛
+        （任一张失败 ⇒ 整个任务 failure，与串行版语义一致）。
+        """
+        blob = media.blob_from_source(
+            url, max_bytes=self.settings.max_download_bytes,
+            transport=self._http_transport)
+        blob, notes = media.normalize(
+            blob, max_side=self.settings.normalize_max_side,
+            max_bytes=self.settings.normalize_max_bytes,
+            enabled=self.settings.normalize_uploads)
+        uploaded, traces = self.uploader.upload_bytes(
+            content=blob.data, mime=blob.mime, name=blob.name, dry_run=dry_run)
+        return uploaded, notes, traces
+
+    def submit(self, task_id: str, *, dry_run: bool = False) -> dict[str, Any]:
+        """把一条 `queued` 任务建到上游。🔴 **计费动作**（`dry_run=True` 时零消耗）。
+
+        顺序：闸门 → 上传输入图 → 建任务。
+        """
+        full = self.store.get_full(task_id)
+        if not full:
+            raise TaskNotFoundError(f"任务 {task_id} 不存在。")
+        plan = full["plan"] or {}
+        self.store.update_task(task_id, attempts=(full.get("attempts") or 0) + 1)
+
+        decision = self.gate.check()
+        if not decision.allowed:
+            logger.bind(task_id=task_id).debug(f"闸门拦截：{decision.reason}")
+            return {"submitted": False, "reason": decision.reason}
+
+        self._require_upstream()
+
+        # ① 输入图 → fileList（**并行 ingest**：取源→归一化→上传，每张一条独立流水线）
+        # 张与张相互独立 ⇒ 墙钟 ≈ 最慢一张，而不是求和（三参考实测 ~20s → ~5s）。
+        # 🔴 这一段的失败**一定没有**上游任务（可能连建任务请求都没发出）
+        # ⇒ 标记 `pre_create`，协调器据此判断"可安全重试"还是"判失败"。
+        image_urls = list(plan.get("image_urls") or [])
+        file_list: list[dict[str, Any]] = []
+        try:
+            if image_urls:
+                workers = max(1, min(self.settings.ingest_parallelism, len(image_urls)))
+                if workers == 1:
+                    results = [self._ingest_one(u, dry_run=dry_run) for u in image_urls]
+                else:
+                    with ThreadPoolExecutor(max_workers=workers,
+                                            thread_name_prefix="ingest") as pool:
+                        #: `map` 保序 ⇒ fileList 顺序 = 请求顺序（上游按顺序理解垫图语义）
+                        results = list(pool.map(
+                            lambda u: self._ingest_one(u, dry_run=dry_run), image_urls))
+                for uploaded, norm_notes, traces in results:
+                    for note in norm_notes:
+                        self.store.add_degradation(task_id, note)
+                    for t in traces:
+                        OBS.upstream(f"upload.{t.get('stage')}", task_id=task_id, **t)
+                    file_list.append(uploaded.to_file_list_entry())
+        except AdapterError as e:
+            #: 只有**瞬时类**失败才值得重试（5xx/连接类）；4xx 是调用方问题，重试无意义。
+            if e.status_code >= 500:
+                e.pre_create = True
+            raise
+
+        # ② 建任务
+        batch_id, trace = self.client.create_image(
+            model_id=plan["upstream_model"],
+            desc=plan.get("desc") or "",
+            file_list=file_list,
+            quantity=int(plan.get("quantity") or 1),
+            aspect_ratio=plan.get("aspect_ratio"),
+            resolution=plan.get("resolution"),
+            quality=plan.get("quality"),
+            reference_mode=plan.get("reference_mode"),
+            use_origin_prompt=bool(plan.get("use_origin_prompt", True)),
+            dry_run=dry_run,
+        )
+        OBS.upstream("create_image", task_id=task_id, **trace)
+
+        if dry_run:
+            return {"submitted": False, "dry_run": True, "trace": trace,
+                    "file_list": file_list}
+
+        self.gate.note_submit()
+        self.store.update_task(
+            task_id, status=ST_IN_PROGRESS, upstream_batch_id=batch_id,
+            submitted_at=time.time())
+        return {"submitted": True, "upstream_batch_id": batch_id, "trace": trace}
+
+    # ------------------------------------------------------------------ 轮询
+
+    def poll_many(self, tasks: list[dict[str, Any]], *,
+                  dry_run: bool = False) -> dict[str, Any]:
+        """**一次**上游查询推进**全部**在途任务（主路径），窗口外的再**一次** v4 兜底。
+
+        🔴 这是本项目的批量轮询设计：hailuo 的 `my/batch` 端点不带 id 参数
+        （它回"我最近的若干条"）⇒ 一轮 tick 的主路径查询次数与在途任务数**无关**，
+        恒为 1 次。这与 jimeng 的"合并 id 查询"是同一目标、不同手段。
+
+        窗口没覆盖到的任务（例如被账号历史记录挤出"最近 N 条"）**合并成一次**
+        v4 点名直查（`/v4/api/multimodal/video/processing`）——
+        所以一轮 tick 的上游查询**至多 2 次**，仍与在途任务数无关。
+        """
+        if not tasks:
+            return {"polled": 0, "updated": 0}
+        self._require_upstream()
+
+        # ---- 起轮宽限：刚提交的任务先别问
+        # 🔴 这个旋钮曾经**读了但没用**（`POLL_GRACE` 只被写进配置没人消费）。
+        # 语义：建任务返回后 ≤ `poll_grace` 秒内不查上游 —— 因为此刻它几乎必然
+        # 还没落库，问了也是白问（纯浪费一次请求）。宽限期过后**再问一次是零代价的**，
+        # 所以这个值取小（默认 0.5s）而不是取大。
+        now = time.time()
+        grace = self.settings.poll_grace
+        deferred = [t for t in tasks
+                    if t.get("submitted_at") and now - t["submitted_at"] < grace]
+        if deferred:
+            deferred_ids = {t["task_id"] for t in deferred}
+            tasks = [t for t in tasks if t["task_id"] not in deferred_ids]
+        if not tasks:
+            # 全部都在宽限期内 ⇒ 本轮不打上游（**这是一次被省掉的请求**）
+            return {"polled": 0, "updated": 0, "deferred": len(deferred)}
+
+        wanted = {t["task_id"]: t for t in tasks}
+        batch_ids = {t.get("upstream_batch_id"): t["task_id"]
+                     for t in tasks if t.get("upstream_batch_id")}
+
+        # 只查图片类型；多取一些，因为我们用的是"我最近 N 条"的语义
+        limit = max(30, min(100, len(wanted) * 4))
+        batches, trace = self.client.fetch_batches(
+            limit=limit, feed_types=[FEED_TYPE_IMAGE], dry_run=dry_run)
+        OBS.upstream("fetch_batches", **trace)
+        if dry_run:
+            return {"polled": 0, "updated": 0, "dry_run": True, "trace": trace}
+
+        updated = 0
+        seen: set[str] = set()
+        for batch_id, feeds in batches:
+            task_id = batch_ids.get(batch_id)
+            if not task_id:
+                continue
+            seen.add(task_id)
+            if self._apply_feeds(task_id, feeds):
+                updated += 1
+
+        # ---- v4 按 id 兜底 ----
+        # `my/batch` 回的是"我最近 N 条"，任务可能被账号里的历史记录挤出窗口。
+        # 窗口没覆盖到的任务**合并成一次** v4 点名直查
+        # （`/v4/api/multimodal/video/processing` 收 `batchInfoList`，一次带多个 id）。
+        # 最坏情况一轮 2 次上游查询，仍与在途任务数无关；兜底失败**保持非终态**
+        # —— "查不到/查挂了"都不是"任务失败"，与主路径对 missing 的语义一致。
+        missing = [tid for tid in batch_ids.values() if tid not in seen]
+        fallback: dict[str, Any] = {}
+        if missing:
+            bid_by_task = {tid: bid for bid, tid in batch_ids.items()}
+            to_query = [bid_by_task[tid] for tid in missing][:50]
+            try:
+                v4_batches, v4_trace = self.client.fetch_by_ids(to_query)
+                OBS.upstream("fetch_by_ids", **v4_trace)
+                fallback["polled"] = len(to_query)
+                for batch_id, feeds in v4_batches:
+                    task_id = batch_ids.get(batch_id)
+                    if not task_id or task_id in seen:
+                        continue
+                    seen.add(task_id)
+                    if self._apply_feeds(task_id, feeds):
+                        fallback["updated"] = fallback.get("updated", 0) + 1
+                        updated += 1
+            except AdapterError as e:
+                #: 上游对"id 还没落库"的回应形态未取证 —— 把它当失败 =
+                #: 让人为一个还在排队的任务哭丧。留痕、保持非终态即可。
+                fallback["error"] = f"{type(e).__name__}: {e}"
+                logger.debug(f"v4 兜底查询失败（保持非终态）：{e}")
+
+        # 主窗口与 v4 点名都没查到的任务：只是"还没进列表"，**保持非终态**（不是失败）。
+        still_missing = [tid for tid in batch_ids.values() if tid not in seen]
+        if still_missing:
+            logger.debug(f"{len(still_missing)} 个任务主窗口与 v4 兜底均未返回，保持非终态等待")
+        out = {"polled": len(tasks), "updated": updated,
+               "missing": len(still_missing), "trace": trace}
+        if fallback:
+            out["fallback"] = fallback
+        if deferred:
+            out["deferred"] = len(deferred)
+        return out
+
+    def _apply_feeds(self, task_id: str, feeds: list[Feed]) -> bool:
+        """把上游某个 batch 下的 feeds 应用到本地任务。返回是否推进了终态。
+
+        同时服务两种来源：`my/batch` 的 feeds 与 v4 直查的 assets ——
+        v4 形态的空 feed_id 不写库，避免把已有值覆盖成空串。
+
+        🔴 **多张任务的收口条件**（2026-09-21 n=2 实测教训）：上游对
+        `quantity=2` 真的回 **2 条 feed**，但两条**不是同时就绪** ——
+        第一条就绪时第二条可能还在跑。若"见到成功就终态"，第二张就
+        白花钱还拿不到。规则：
+
+        · 成功且带 URL 的条数 ≥ 计划张数（plan.quantity）⇒ 终态成功，聚合全部产物；
+        · 已有失败终态：有产物 ⇒ 按已有产物成功（部分成功也是可用交付）；
+          零产物 ⇒ 终态失败（取第一条失败原因）；
+        · 其余（产物未齐、无人失败）⇒ **保持非终态**继续等（超时看门狗兜底）。
+        """
+        if not feeds:
+            return False
+
+        full = self.store.get_full(task_id) or {}
+        expected = max(1, int(((full.get("plan") or {}).get("quantity")) or 1))
+
+        success = [f for f in feeds if f.is_succeeded and f.url]
+        failed = [f for f in feeds if f.is_failed]
+
+        if len(success) < expected and not failed:
+            # 产物未齐且无人失败 ⇒ 继续等（n=2 第一条就绪时的正确姿势）
+            status = max((f.status or -1) for f in feeds)
+            self.store.update_task(task_id, upstream_status=status)
+            return False
+
+        if success:
+            # 一个 batch 可能有多张（quantity>1）—— 取**全部成功的**作为产物。
+            primary = max(success, key=lambda f: f.create_time or 0)
+            if len(success) < expected:
+                logger.bind(task_id=task_id).warning(
+                    f"部分成功：计划 {expected} 张，上游交付 {len(success)} 张"
+                    f"（另有 {len(failed)} 条失败）——按已有产物交付")
+            self.store.update_task(
+                task_id, status=ST_SUCCEEDED,
+                **({"upstream_feed_id": primary.feed_id} if primary.feed_id else {}),
+                upstream_status=primary.status,
+                finished_at=time.time(),
+                result={
+                    "data": [{"url": f.url} for f in success],
+                    "created": int((success[0].create_time or time.time() * 1000) / 1000),
+                    "images": len(success),
+                    "model_id": success[0].model_id,
+                    "width": success[0].width,
+                    "height": success[0].height,
+                    "file_name": success[0].file_name,
+                    "url_no_watermark": [f.url_no_watermark for f in success],
+                },
+            )
+            OBS.event("task.succeeded", task_id=task_id, images=len(success))
+            logger.bind(task_id=task_id).info(f"任务成功：{len(success)} 张图")
+            return True
+
+        # 零产物 + 有失败 ⇒ 失败（取第一条失败原因）
+        feed = failed[0]
+        code, message = feed.failure() or ("task_failed", "上游生成失败。")
+        detail = feed.message or ""
+        self.store.update_task(
+            task_id, status=ST_FAILURE,
+            **({"upstream_feed_id": feed.feed_id} if feed.feed_id else {}),
+            upstream_status=feed.status, finished_at=time.time(),
+            error={"message": message + (f" 上游消息：{detail}" if detail else ""),
+                   "type": "upstream_error", "code": code},
+        )
+        OBS.event("task.failed", task_id=task_id, upstream_status=feed.status,
+                  upstream_status_name=status_name(feed.status))
+        logger.bind(task_id=task_id).warning(
+            f"任务失败：{status_name(feed.status)} {message}")
+        return True
+
+    # ------------------------------------------------------------------ 查询
+
+    def get_for_credential(self, task_id: str,
+                           credential: str | None) -> dict[str, Any]:
+        """按 id 取任务。**带 Key 时必须属于该 Key**；不带 Key 放行（id 即凭据）。
+
+        ⚠️ 刻意**不区分**"不存在"与"不属于你" —— 区分开等于确认 id 存在。
+        """
+        full = self.store.get_full(task_id)
+        if not full:
+            raise TaskNotFoundError(f"任务 {task_id} 不存在，或不属于当前 API Key。")
+        if credential is not None and full.get("credential_id") != credential:
+            raise TaskNotFoundError(f"任务 {task_id} 不存在，或不属于当前 API Key。")
+        return full
+
+    def list_for_credential(self, credential: str, *, limit: int = 50) -> dict[str, Any]:
+        """**只列自己的** —— 只按服务过滤会把别人的任务列给你。"""
+        rows = self.store.list_for_credential(credential, limit=limit)
+        return {"object": "list", "data": [
+            {"task_id": r["task_id"], "status": r["status"], "model": r["model"],
+             "capability": r["capability"], "created_at": r["created_at"]}
+            for r in rows
+        ]}
+
+    def delete_for_credential(self, task_id: str, credential: str) -> dict[str, Any]:
+        """删除**已终态**的任务。未终态**响亮失败**。"""
+        full = self.get_for_credential(task_id, credential)
+        if full["status"] not in TERMINAL:
+            raise TaskNotDeletable(
+                f"任务 {task_id} 状态是 {full['status']!r}，未到终态 ⇒ 不能删。"
+                f"⚠️ hailuo **没有取消端点**：本地删掉只会让'它还在上游跑并可能计费'"
+                f"变成看不见的事。请等到终态再删。")
+        self.store.delete_task(task_id)
+        return {"task_id": task_id, "status": "DELETED"}
+
+    # ------------------------------------------------------------------ 状态
+
+    def status(self) -> dict[str, Any]:
+        return {
+            "service": self.settings.otel_service_name,
+            "upstream_configured": self.settings.upstream_configured,
+            "auth_enabled": self.settings.auth_enabled,
+            "concurrency_limit": self.settings.hl_concurrency,
+            "gate": self.gate.stats(),
+            "store": self.store.stats(),
+            "capabilities": {**models.status(),
+                             "degradations": self._caps_degradations,
+                             "refreshed_at": self._caps_refreshed_at},
+            "observability": OBS.status(),
+            "upload_cache": self._uploader.cache_stats() if self._uploader else None,
+        }
+
+
+# ---------------------------------------------------------------------------
+# 响应构造 —— **唯一出口**
+# ---------------------------------------------------------------------------
+
+
+def view(record: dict[str, Any]) -> tuple[int, dict[str, Any]]:
+    """任务记录 → `(HTTP 状态码, 响应体)`。**唯一出口。**
+
+    · 非终态 → **202** + `{task_id, status}`（调用方据此继续轮询）；
+    · 成功 → **200** + `{data: [{url}], created, usage}`；
+    · 失败 → **200** + `{task_id, status: "failure", error}`。
+
+    ⚠️ **失败也回 200**：任务本身完成了（只是结果是失败），请求没出错。
+    回 4xx 会误触发调用方的重试逻辑。
+
+    `degradations` 仅在非空时出现（本服务的加性扩展）。
+    """
+    task_id = record["task_id"]
+    status = record["status"]
+    degradations = record.get("degradations") or []
+
+    if status not in TERMINAL:
+        body: dict[str, Any] = {"task_id": task_id, "status": status}
+        if degradations:
+            body["degradations"] = degradations
+        return 202, body
+
+    if status == ST_SUCCEEDED:
+        result = record.get("result") or {}
+        data = result.get("data") or []
+        usage: dict[str, Any] = {"images": result.get("images", len(data))}
+        plan = record.get("plan") or {}
+        forecast = plan.get("forecast_credits")
+        if forecast is not None:
+            #: 🔴 明说是**预估**：来自上游计价表，不是账单实扣值。
+            usage["forecast_credits"] = forecast
+        body = {
+            "data": [{"url": d["url"]} for d in data],
+            "created": int(result.get("created") or record.get("finished_at") or 0),
+            "usage": usage,
+        }
+        if degradations:
+            body["degradations"] = degradations
+        return 200, body
+
+    error = record.get("error") or {
+        "message": "任务失败（上游未给出原因）。", "type": "upstream_error",
+        "code": "task_failed",
+    }
+    body = {"task_id": task_id, "status": "failure", "error": error}
+    if degradations:
+        body["degradations"] = degradations
+    return 200, body
+
+
+# ---------------------------------------------------------------------------
+# 工具
+# ---------------------------------------------------------------------------
+
+
+def _nearest(*, resolution_options: tuple[str, ...], target: str) -> str:
+    """在一组档位里取最接近 `target` 的。认不出来就取第一个（**并已留痕**）。"""
+    order = ["1K", "2K", "4K"]
+    if target not in order:
+        return resolution_options[0]
+    idx = order.index(target)
+    best = min(resolution_options, key=lambda r: abs(order.index(r) - idx)
+               if r in order else 99)
+    return best
+
+
+def _snap_ratio(value: float, options: tuple[str, ...]) -> str | None:
+    """把数值宽高比吸附到最近的支持档位。`Auto` 不参与吸附（它本身不是数值）。"""
+    best: tuple[float, str] | None = None
+    for opt in options:
+        rv = _ratio_value(opt)
+        if rv is None:
+            continue
+        distance = abs(rv - value)
+        if best is None or distance < best[0]:
+            best = (distance, opt)
+    return best[1] if best else None
+
+
+def _sync_fetch_models(client: Any) -> tuple[list[models.UpstreamModel], list[str]]:
+    """同步版能力表拉取（`capabilities.fetch_models` 是异步的，服务是同步的）。"""
+    #: 刻意惰性导入（与 `refresh_capabilities` 同一理由：让模块导入期保持轻）。
+    from .upstream.hailuo.capabilities import (  # noqa: PLC0415
+        COMMON_CONFIG_PATH,
+        MODEL_INFO_PATH,
+        merge,
+        parse_common_config,
+        parse_model_info,
+    )
+
+    notes: list[str] = []
+    meta: dict[str, Any] = {}
+    info: dict[str, Any] = {}
+    for label, path, parser, sink in (
+        ("create_image_models", COMMON_CONFIG_PATH, parse_common_config, meta),
+        ("imageModels", MODEL_INFO_PATH, parse_model_info, info),
+    ):
+        try:
+            resp = client.get(path, timeout=12.0)
+            resp.raise_for_status()
+            sink.update(parser(resp.json()))
+        except Exception as e:  # noqa: BLE001
+            notes.append(f"上游能力表 {label} 读取失败（{type(e).__name__}）⇒ 该部分退回冻结快照。")
+            logger.warning(f"能力表 {label} 读取失败：{type(e).__name__}: {e}")
+    return merge(meta, info), notes
+
+
+__all__ = ["KNOWN_UNSUPPORTED", "Plan", "Service", "view"]

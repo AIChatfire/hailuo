@@ -1,0 +1,40 @@
+# 静态门禁配置。
+#
+# 设计原则：**只收能抓真缺陷的规则**。一次报上百条的门禁 = 没有门禁
+# （没人看，于是连真问题一起忽略）。
+#
+# 下列规则集都抓到过「能过 compileall、也能正常 import」的线上级缺陷：
+#   F      —— 未定义名。踩过：`client.py::_report()` 引用未 import 的 OBS，
+#             被 `except Exception: pass` 吞掉 ⇒ **上游埋点从来没生效，日志一个字都没有**。
+#   SLF001 —— 跨层摸私有成员。踩过：`service.py` 还在调 SQLite 时代的 `store._connect()`
+#             ⇒ **`Service()` 一构造就 AttributeError**，整个服务起不来。
+#   BLE    —— 裸 except。要求把"我确实要吞掉它"写成显式的 `# noqa: BLE001`，
+#             让每一次吞异常都是一个**可见的决定**。
+#   S110   —— try/except/pass。同上：静默失败会让人以为"这段没跑"。
+
+target-version = "py311"
+line-length = 100
+src = ["app", "tests", "scripts"]
+
+[lint]
+select = [
+    "F",      # pyflakes：未定义名 / 未使用导入 / 重复定义
+    "E9",     # 语法级错误
+    "BLE",    # 盲捕异常（要求显式标注）
+    "S110",   # try/except/pass
+    "PLC0415",# 非顶层 import（会掩盖循环依赖与启动成本）
+    "SLF001", # 私有成员跨类访问
+]
+
+# 刻意**不**收的（想清楚了才加）：
+#   · 全部风格规则（E1/E2/E3/W/…）—— 与缺陷无关，只会淹没上面那几条；
+#   · T20x（print）—— 装配期降级提示刻意用 print 直出（此时 logger 还没配好）。
+
+[lint.per-file-ignores]
+# 测试需要摸内部状态做断言（白盒），这是测试的职责。
+"tests/*" = ["SLF001", "BLE001", "S110", "PLC0415"]
+# 脚本是一次性探针/基准，允许灵活。
+"scripts/*" = ["BLE001", "S110", "PLC0415", "F401"]
+
+[lint.isort]
+known-first-party = ["app"]

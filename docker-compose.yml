@@ -1,0 +1,57 @@
+# hailuo-service —— 图片生成异步出口（图生图为重点能力）
+#
+#   cp .env.example .env      # 填 HAILUO_TOKEN
+#   docker compose up -d --build
+#   curl -s localhost:8300/healthz          # {"status":"ok"}
+
+services:
+  app:
+    build: .
+    image: hailuo-service:latest
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      # 容器内固定走 compose 内网的库；不要在这里覆盖 TASK_DB 去连 127.0.0.1
+      # （容器里的 127.0.0.1 是它自己，不是宿主）。
+      TASK_DB: postgresql+psycopg2://hailuo:${POSTGRES_PASSWORD:-hailuo}@db:5432/hailuo
+      HOST: 0.0.0.0
+      PORT: "8300"
+    ports:
+      - "${APP_PORT:-8300}:8300"
+    depends_on:
+      db:
+        condition: service_healthy
+    # --- 与 Dockerfile 的 HEALTHCHECK 同源，这里只是把间隔写得更显眼
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8300/healthz', timeout=4).status==200 else 1)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: hailuo
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-hailuo}
+      POSTGRES_DB: hailuo
+    # ⚠️ **刻意不发布宿主端口**：应用走 compose 内网 `db:5432`，
+    # 宿主端口毫无必要，而发布它只会制造冲突源 ——
+    # 本机 5432 常年被别的项目占着 ⇒ `compose up` 报 "port is already allocated"，
+    # 看着像本服务的问题，其实不是。要在宿主上做管理：
+    #     docker compose exec db psql -U hailuo -d hailuo
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U hailuo -d hailuo"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  pgdata:
+    # 数据卷刻意不设 name：compose 会按项目名隔离，
+    # 多人/多环境在同一台机器上跑不会互相踩。

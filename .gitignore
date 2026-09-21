@@ -1,0 +1,45 @@
+# 凭据与本地状态 —— 绝不入库
+.env
+.env.*
+!.env.example
+
+# 🔴 抓包产物可能含 token / device_id / 真实产物 URL
+cookie*.txt
+*.cookie
+captures/
+trace*.json
+*.har
+
+# 任务库（SQLite 试跑）
+*.db
+*.db-journal
+*.sqlite
+*.sqlite3
+
+# 上传缓存 / 产物
+bench/
+out/
+outputs/
+
+# E2E 实测产物（可再生成；且 JSON 里含真实产物直链）
+e2e-output/
+e2e-output*/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# 编辑器 / 系统
+.DS_Store
+.idea/
+.vscode/
+
+# 项目记忆（内部工作记录 —— 常含内网地址、账号片段与未公开结论）
+.workbuddy/

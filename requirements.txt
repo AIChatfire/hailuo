@@ -1,0 +1,30 @@
+# hailuo-service 运行期依赖
+#
+# 版本按**实测通过的版本**钉住（不是"最新"）。本仓 2026-09-21 全量 215 用例
+# 在下列版本下通过。
+
+# --- Web 框架与校验
+fastapi==0.141.1
+uvicorn==0.38.0
+pydantic==2.13.5
+
+# --- 上游 HTTP 客户端
+# 签名是自己算的（app/upstream/hailuo/sign.py），httpx 只负责发请求。
+httpx==0.28.1
+
+# --- 任务库
+# 生产 PostgreSQL；SQLite 仅在本地试跑与测试时使用（无需额外驱动）。
+sqlalchemy==2.0.54
+# PostgreSQL 驱动：**改 TASK_DB 为 postgresql+ 前缀时才需要装**
+psycopg2-binary==2.9.10
+
+# --- 输入图归一化（缩放 / 转码）
+# 只有需要压缩超大输入图时才用得上；卸掉它服务仍能跑（会跳过归一化）。
+pillow==11.3.0
+
+# --- 日志与可观测性
+loguru==0.7.3
+logfire==4.16.0
+
+# --- 生产进程管理（容器里用它起多 worker；见 README 的扩容约束）
+gunicorn==23.0.0
