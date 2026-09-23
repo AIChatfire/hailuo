@@ -82,8 +82,34 @@ class UploadedFile:
     size: int | None = None
     from_cache: bool = False
 
+    def to_video_frame_entry(self, frame_type: int) -> dict[str, Any]:
+        """转成**视频** `parameter.fileList[]` 的一项（`frameType` 决定是首帧还是尾帧）。
+
+        🔴 形态来自**真实抓包**（参考实现 `openai_videos.py` 里的 `sora2-i2v`
+        请求实录，五键）：
+
+        ```json
+        {"id": "469914687591321600", "url": "https://…/xxx.jpeg",
+         "name": "cropped_1768892531810.jpeg", "type": "jpeg", "frameType": 0}
+        ```
+
+        `frameType`：**0 = 首帧，1 = 尾帧**（`start-end-frames` 模式）。
+
+        ⚠️ 刻意**不用**图片链路那 12 键的全形态（多了 `characterID` /
+        `referenceType` / `assetFileType` / `videoID` …）—— 那些是**图片**侧抓包的字段，
+        搬到视频端点等于往上发一堆没证据的键；而视频端点出错时回的是与图片同一个
+        `code:2 请求异常`，不带到底是哪个键有问题 ⇒ 少发比多发好排障。
+        """
+        return {
+            "id": self.file_id,
+            "url": self.url,
+            "name": self.name,
+            "type": self.file_type,
+            "frameType": int(frame_type),
+        }
+
     def to_file_list_entry(self) -> dict[str, Any]:
-        """转成上游 `parameter.fileList[]` 的一项。
+        """转成上游**图片** `parameter.fileList[]` 的一项。
 
         字段对照抓包（feed 的 `modelParameter.imageParameter.fileList[0]`）：
         `id` 是 **fileID**（不是本地 id），`frameType: 3`、`referenceType: 0`、

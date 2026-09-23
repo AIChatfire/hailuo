@@ -106,6 +106,10 @@ def test_non_json_maps_to_upstream_error(fake) -> None:
     (2, "请求异常，请检查请求参数", InvalidParameterError),
     (1001, "请先登录", AuthError),
     (30, "积分不足，请充值", UpstreamQuotaExhausted),
+    #: 🔴 视频侧的余额叫**贝壳**（图片侧说"积分"），且文案里**没有**"积分/额度/余额"
+    #: 任何一个词 —— 2026-09-23 实测建任务回 `code=2200005 贝壳不足`。
+    #: 只按文案匹配会漏成通用 upstream_error，调用方拿不到"充值"这个可执行结论。
+    (2200005, "贝壳不足", UpstreamQuotaExhausted),
     (31, "操作过于频繁，请稍后再试", RiskControlChallenge),
     (32, "内容包含敏感信息", ContentPolicyError),
     (99, "内部错误", UpstreamError),
@@ -116,6 +120,17 @@ def test_business_code_mapping(fake, code, message, expected) -> None:
         200, json={"statusInfo": {"code": code, "message": message}})
     with pytest.raises(expected):
         _client(fake).fetch_processing()
+
+
+def test_quota_error_tells_the_caller_retry_is_useless(fake) -> None:
+    """额度不足是**账户级**结论 ⇒ 必须在错误文案里说清"重试无用"。"""
+    from app.errors import UpstreamQuotaExhausted
+
+    fake.force_error["/api/feed/creation/my/processing"] = httpx.Response(
+        200, json={"statusInfo": {"code": 2200005, "message": "贝壳不足"}})
+    with pytest.raises(UpstreamQuotaExhausted) as ei:
+        _client(fake).fetch_processing()
+    assert "重试无用" in str(ei.value) and "贝壳" in str(ei.value)
 
 
 # ---------------------------------------------------------------------------

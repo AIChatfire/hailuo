@@ -28,9 +28,10 @@ import pytest
 
 from app.config import Settings
 from app.service import Service
-from app.store import TaskStore
+from app.store import TaskStore, VideoTaskStore
+from app.video_service import VideoService
 from app.upstream.hailuo import upload as up_mod
-from app.upstream.hailuo.client import HailuoClient, ST_SUCCESS
+from app.upstream.hailuo.client import HailuoClient, ST_CREATING, ST_SUCCESS
 
 # ---------------------------------------------------------------------------
 # 假上游
@@ -115,6 +116,8 @@ class FakeHailuo:
     def __init__(self) -> None:
         #: 建任务收到的请求体（测试断言翻译层正确性）
         self.create_calls: list[dict[str, Any]] = []
+        #: **视频**建任务收到的请求体（`fileList[].frameType` 断言靠它）
+        self.video_create_calls: list[dict[str, Any]] = []
         #: 上传回调收到的请求体
         self.callback_calls: list[dict[str, Any]] = []
         #: 批量查询次数（断言"一轮只打一次上游"）
@@ -129,6 +132,10 @@ class FakeHailuo:
         self.feed_url: dict[str, str] = {}
         #: batch_id -> v4 点名直查要回的 asset（与 `my/batch` 窗口**互相独立**）
         self.v4_batches: dict[str, dict[str, Any]] = {}
+        #: 🔴 batch_id -> **视频** feed 规格（`my/batch` + `feedTypes=[0]` 形态）。
+        #: 形态取自 2026-09-23 的真实视频批次实测：
+        #: `metaInfo.videoMetaInfo.mediaInfo.{url,downloadURL,width,height}`。
+        self.video_feeds: dict[str, dict[str, Any]] = {}
         #: 输入图 URL -> 字节
         self.images: dict[str, bytes] = {}
         #: 🔴 每次请求携带的 `token` 头（透传路由断言：两条任务须带各自的 token）
@@ -165,9 +172,52 @@ class FakeHailuo:
             "percent": percent, "message": message, "createTime": create_time,
         }
 
+    def set_video_feed(self, batch_id: str, *, status: int = ST_CREATING,
+                       url: str = "", width: int = 1364, height: int = 768,
+                       duration_ms: int = 5920) -> None:
+        """登记一条**视频** feed（`my/batch` 视频形态，逐字段对齐真实抓包）。"""
+        self.video_feeds[batch_id] = {
+            "status": status, "url": url, "width": width, "height": height,
+            "duration_ms": duration_ms,
+        }
+
+    def hide_video_from_batch(self, batch_id: str) -> None:
+        """把视频 batch 从 `my/batch` 抽走（测 v4 兜底路径）。"""
+        self.video_feeds.pop(batch_id, None)
+
     def hide_from_batch(self, batch_id: str) -> None:
         """把 batch 从 `my/batch` 窗口抽走（模拟"被账号历史挤出最近 N 条"）。"""
         self.feed_status.pop(batch_id, None)
+
+    def _video_batches(self) -> list[dict[str, Any]]:
+        """`my/batch` 的**视频**形态（2026-09-23 真实抓包：产物在 `videoMetaInfo`）。"""
+        out: list[dict[str, Any]] = []
+        for batch_id, spec in self.video_feeds.items():
+            url = spec["url"]
+            out.append({
+                "batchID": batch_id,
+                "batchCreateTime": 1789922888112,
+                "feedType": 0,
+                "feeds": [{
+                    "feedType": 0,
+                    "commonInfo": {"id": f"vfeed-{batch_id}", "batchID": batch_id,
+                                   "createTime": 1789922888112, "status": spec["status"]},
+                    "feedMessage": {"message": ""},
+                    "modelParameter": {"videoParameter": {
+                        "modelID": "23210", "desc": "push in"}},
+                    "metaInfo": {"videoMetaInfo": {
+                        "hasVoice": False, "duration": 6,
+                        "durationMs": spec["duration_ms"],
+                        "mediaInfo": {
+                            "url": url,
+                            "downloadURL": {"watermarkURL": url,
+                                            "withoutWatermarkURL": url,
+                                            "fileName": "Hailuo_Video_fake",
+                                            "fileID": "99"},
+                            "width": spec["width"], "height": spec["height"]}}},
+                }],
+            })
+        return out
 
     # ------------------------------------------------------------------ 路由
 
@@ -264,9 +314,32 @@ class FakeHailuo:
                         "task": {"batchID": batch_id, "videoIDs": [record_id]},
                         "isFirstGenerate": True})
 
+        # ---- 建**视频**任务
+        #: 与图片端点同构（同样有 data.id / data.task.batchID 两个 id 的陷阱），
+        #: 差别只在响应里的 `videoIDs` 与"默认先回一个非终态"。
+        if path == "/v2/api/multimodal/generate/video":
+            body = json.loads(request.content or b"{}")
+            self.video_create_calls.append(body)
+            batch_id = f"66812{next(self._seq):015d}"
+            record_id = f"66813{next(self._seq):015d}"
+            #: 默认给出**进行中**的 feed（视频是分钟级的，测试自己再改终态）。
+            #: 两条路都登记：主路径走 `my/batch`，兜底走 v4（按**记录 id**）。
+            self.set_video_feed(batch_id, status=ST_CREATING, url="")
+            self.v4_batches[record_id] = {
+                "batchID": record_id, "status": ST_CREATING, "downloadURL": "",
+                "percent": 11, "message": "", "createTime": 1789922888112}
+            return _ok({"id": record_id,
+                        "task": {"batchID": batch_id, "videoIDs": [record_id]},
+                        "isFirstGenerate": True})
+
         # ---- 批量查询
         if path == "/api/feed/creation/my/batch":
             self.batch_calls += 1
+            _body = json.loads(request.content or b"{}")
+            if 0 in (_body.get("feedTypes") or []):
+                return _ok({"batchFeeds": self._video_batches(), "processing": False,
+                            "hasPre": False, "hasNext": False,
+                            "total": len(self.video_feeds)})
             feeds = []
             for batch_id, status in self.feed_status.items():
                 feeds.append({
@@ -346,9 +419,13 @@ def _restore_runtime_models() -> Any:
     """
     from app import models
 
+    from app.upstream.hailuo import video_models as vmodels
+
     saved = models.runtime_models()
+    saved_video = vmodels.runtime_video_models()
     yield
     models.install_runtime_models(saved)
+    vmodels.install_runtime_video_models(saved_video)
 
 
 @pytest.fixture()
@@ -395,6 +472,22 @@ def service(settings: Settings, store: TaskStore, fake: FakeHailuo) -> Service:
 
 
 @pytest.fixture()
+def video_service(settings: Settings, fake: FakeHailuo) -> VideoService:
+    """**全链路桩化的 VideoService**：零真实上游调用，落在**视频**那张表上。"""
+    client = HailuoClient(token="fake-token-for-tests",
+                          base_url="https://hailuoai.video",
+                          device=settings.device_profile(),
+                          transport=fake.transport())
+    oss = httpx.Client(transport=fake.transport(), timeout=10.0)
+    uploader = up_mod.Uploader(client=client, oss_client=oss, cache_ttl=60.0)
+    svc = VideoService(settings, store=VideoTaskStore(settings.db_target),
+                       client=client, uploader=uploader,
+                       fetch_capabilities=False, http_transport=fake.transport())
+    svc.register_credential(FAKE_JWT)
+    return svc
+
+
+@pytest.fixture()
 def client(settings: Settings, service: Service) -> Any:
     """FastAPI TestClient（**不跑 lifespan**，避免起协调器线程）。
 
@@ -405,6 +498,24 @@ def client(settings: Settings, service: Service) -> Any:
     from app.main import create_app
 
     app = create_app(settings, service=service)
+    return TestClient(app)
+
+
+@pytest.fixture()
+def video_client(settings: Settings, service: Service,
+                 video_service: VideoService) -> Any:
+    """`TestClient` + 注入的 `video_service`（**不跑 lifespan**，不起协调器线程）。
+
+    注入方式：按常规装配（图片服务用 `service` 夹具），再把
+    `app.state.video_service` 换成视频那一份 —— 夹具里的 `fake` 是断言的入口
+    （"发出去的 body 长什么样"）。
+    """
+    from fastapi.testclient import TestClient
+
+    from app.main import create_app
+
+    app = create_app(settings, service=service)
+    app.state.video_service = video_service
     return TestClient(app)
 
 

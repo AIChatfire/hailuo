@@ -12,13 +12,24 @@
    —— 用 `Semaphore` 的话重启归零，而库里那些任务其实还在上游跑；
 3. **协调器靠数据库租约选主** ⇒ 多 worker 下只有一个真正在执行。
 
-## 三张表
+## 四张表
 
 | 表 | 作用 |
 |---|---|
-| `tasks` | 任务本身 |
+| `tasks` | **图片**任务本身（`TaskRow`） |
+| `video_tasks` | **视频**任务本身（`VideoTaskRow`）—— 见下 |
 | `meta` | 进程级键值（目前只存**指纹密钥**——让明文 Key 永不落库） |
 | `leases` | 协调器租约（`leader_key` → `expires_at`） |
+
+## 为什么视频用**另一张表**而不是加一列
+
+图片任务的 id 是 `hailuo_<32hex>`，视频（火山 Seedance 协议）的 id 是
+`cgt-<时间戳>-<随机>` ——两套 id 空间，且两侧的**列表**端点都要各自干净
+（`GET /async/v1/images/generations` 不该冒出视频任务，反之亦然）。
+
+加一列 `kind` 需要迁移既有库（`create_all` 只建表不改列 ⇒ 老库会缺列而炸），
+而新开一张表对既有部署是**纯加性**的。两者共享同一个 `TaskStore` 实现
+（`row_cls` 参数化），没有复制第二份存储逻辑。
 
 ## 凭据纪律
 
@@ -64,18 +75,27 @@ class Base(DeclarativeBase):
     pass
 
 
-class TaskRow(Base):
-    __tablename__ = "tasks"
+class _TaskColumns(Base):
+    """任务行的**列定义**（`__abstract__` ⇒ 不建表，只被下面两张表复用）。
+
+    图片与视频任务结构完全一致，差别只在"放哪张表" —— 用抽象基类而不是
+    映射继承，是因为**映射继承会走 joined-table**：它要求子表与父表各有一行
+    且带外键，那是把两种任务重新焊在一起，正是这里要避开的。
+    """
+
+    __abstract__ = True
 
     task_id: Mapped[str] = mapped_column(String(64), primary_key=True)
     credential_id: Mapped[str] = mapped_column(String(64), index=True)
-    #: 对外能力名（hailuo-i2i / hailuo-t2i …）
+    #: 对外能力名（图片：hailuo-i2i / hailuo-t2i…；视频：hailuo-video / hailuo-2.3 …）
     capability: Mapped[str] = mapped_column(String(32))
     #: 调用方请求的原始 model 字符串
     model: Mapped[str] = mapped_column(String(64), default="")
     #: 真正发到上游的 modelID
     upstream_model: Mapped[str] = mapped_column(String(64), default="")
     status: Mapped[str] = mapped_column(String(16), index=True, default=ST_QUEUED)
+
+    __abstract__ = True
 
     request_json: Mapped[str] = mapped_column(Text, default="{}")
     plan_json: Mapped[str] = mapped_column(Text, default="{}")
@@ -94,10 +114,6 @@ class TaskRow(Base):
     updated_at: Mapped[float] = mapped_column(Float)
     submitted_at: Mapped[float | None] = mapped_column(Float, nullable=True)
     finished_at: Mapped[float | None] = mapped_column(Float, nullable=True)
-
-    __table_args__ = (
-        Index("ix_tasks_status_created", "status", "created_at"),
-    )
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -120,6 +136,28 @@ class TaskRow(Base):
         }
 
 
+class TaskRow(_TaskColumns):
+    """图片任务（`/async/v1/images/generations`）。"""
+
+    __tablename__ = "tasks"
+    __table_args__ = (
+        Index("ix_tasks_status_created", "status", "created_at"),
+    )
+
+
+class VideoTaskRow(_TaskColumns):
+    """视频任务（火山 Seedance 协议出口）。
+
+    与 `TaskRow` **同构但不同表** —— 两套管线的 id 空间不同
+    （`hailuo_<hex>` vs `cgt-<时间戳>-<随机>`），列表端点也各自干净。
+    """
+
+    __tablename__ = "video_tasks"
+    __table_args__ = (
+        Index("ix_video_tasks_status_created", "status", "created_at"),
+    )
+
+
 class MetaRow(Base):
     __tablename__ = "meta"
 
@@ -140,8 +178,25 @@ def new_task_id(prefix: str = "hailuo") -> str:
     return f"{prefix}_{uuid.uuid4().hex}"
 
 
+def new_video_task_id(*, now: float | None = None, suffix_len: int = 10) -> str:
+    """火山 Seedance 形态的任务 id：`cgt-YYYYMMDDHHMMSS-<随机>`。
+
+    · 前缀与时间戳段**逐字段**对齐原生 `cgt-` 形态（调用方按原生解析即可）；
+    · 随机段取 **10 位十六进制**（原生样本是 5 位）—— 5 位只有 100 万分之一
+      的空间，同一秒内并发受理会有可观的碰撞概率；id 同时是**读接口的凭据**，
+      所以宁可比原生长一点，也不要可猜。
+
+    ⚠️ 时间戳用 **UTC** —— 服务端没有调用方时区，编一个时区等于伪造事实。
+    """
+    stamp = time.strftime("%Y%m%d%H%M%S", time.gmtime(now if now is not None else time.time()))
+    return f"cgt-{stamp}-{uuid.uuid4().hex[:suffix_len]}"
+
+
 class TaskStore:
     """任务库。**所有对 tasks 表的读写都要经过这里。**"""
+
+    #: **行模型** —— 所有查询都走它，子类换一张表即可复用全部存取逻辑。
+    row_cls: type = TaskRow
 
     def __init__(self, dsn: str, *, pool_size: int = 5, max_overflow: int = 10,
                  pool_recycle: int = 1800, pre_ping: bool = True,
@@ -178,7 +233,7 @@ class TaskStore:
     def ping(self) -> bool:
         try:
             with self.engine.connect() as conn:
-                conn.execute(select(func.count()).select_from(TaskRow))
+                conn.execute(select(func.count()).select_from(self.row_cls))
             return True
         except Exception as e:  # noqa: BLE001
             logger.warning(f"任务库不可连：{type(e).__name__}: {e}")
@@ -223,7 +278,7 @@ class TaskStore:
 
     def create_task(self, **fields: Any) -> dict[str, Any]:
         now = time.time()
-        row = TaskRow(
+        row = self.row_cls(
             task_id=fields.pop("task_id", None) or new_task_id(),
             created_at=now, updated_at=now, **fields,
         )
@@ -243,11 +298,11 @@ class TaskStore:
             fields["error_json"] = json.dumps(
                 fields.pop("error"), ensure_ascii=False)
         with self.session() as s:
-            s.execute(update(TaskRow).where(TaskRow.task_id == task_id).values(**fields))
+            s.execute(update(self.row_cls).where(self.row_cls.task_id == task_id).values(**fields))
 
     def add_degradation(self, task_id: str, note: str) -> None:
         with self.session() as s:
-            row = s.get(TaskRow, task_id)
+            row = s.get(self.row_cls, task_id)
             if not row:
                 return
             notes = json.loads(row.degradations_json or "[]")
@@ -258,19 +313,19 @@ class TaskStore:
 
     def delete_task(self, task_id: str) -> bool:
         with self.session() as s:
-            res = s.execute(delete(TaskRow).where(TaskRow.task_id == task_id))
+            res = s.execute(delete(self.row_cls).where(self.row_cls.task_id == task_id))
             return bool(res.rowcount)
 
     # ------------------------------------------------------------------ 读
 
     def get(self, task_id: str) -> dict[str, Any] | None:
         with self.session() as s:
-            row = s.get(TaskRow, task_id)
+            row = s.get(self.row_cls, task_id)
             return row.to_dict() if row else None
 
     def get_full(self, task_id: str) -> dict[str, Any] | None:
         with self.session() as s:
-            row = s.get(TaskRow, task_id)
+            row = s.get(self.row_cls, task_id)
             if not row:
                 return None
             out = row.to_dict()
@@ -285,8 +340,8 @@ class TaskStore:
     def list_for_credential(self, credential_id: str, *, limit: int = 50) -> list[dict]:
         with self.session() as s:
             rows = s.scalars(
-                select(TaskRow).where(TaskRow.credential_id == credential_id)
-                .order_by(TaskRow.created_at.desc()).limit(limit)
+                select(self.row_cls).where(self.row_cls.credential_id == credential_id)
+                .order_by(self.row_cls.created_at.desc()).limit(limit)
             ).all()
             return [r.to_dict() for r in rows]
 
@@ -294,21 +349,21 @@ class TaskStore:
         """在途任务数 —— **`HL_CONCURRENCY` 的判据**（按库计数，重启安全）。"""
         with self.session() as s:
             return int(s.scalar(
-                select(func.count()).select_from(TaskRow)
-                .where(TaskRow.status == ST_IN_PROGRESS)) or 0)
+                select(func.count()).select_from(self.row_cls)
+                .where(self.row_cls.status == ST_IN_PROGRESS)) or 0)
 
     def count_queued(self) -> int:
         with self.session() as s:
             return int(s.scalar(
-                select(func.count()).select_from(TaskRow)
-                .where(TaskRow.status == ST_QUEUED)) or 0)
+                select(func.count()).select_from(self.row_cls)
+                .where(self.row_cls.status == ST_QUEUED)) or 0)
 
     def due_for_submit(self, *, limit: int = 10) -> list[dict[str, Any]]:
         """该建任务的任务（`queued`，按创建时间先进先出）。"""
         with self.session() as s:
             rows = s.scalars(
-                select(TaskRow).where(TaskRow.status == ST_QUEUED)
-                .order_by(TaskRow.created_at.asc()).limit(limit)
+                select(self.row_cls).where(self.row_cls.status == ST_QUEUED)
+                .order_by(self.row_cls.created_at.asc()).limit(limit)
             ).all()
             return [r.to_dict() for r in rows]
 
@@ -316,8 +371,8 @@ class TaskStore:
         """在途任务（`in_progress`）—— 协调器一轮要查的集合。"""
         with self.session() as s:
             rows = s.scalars(
-                select(TaskRow).where(TaskRow.status == ST_IN_PROGRESS)
-                .order_by(TaskRow.submitted_at.asc()).limit(limit)
+                select(self.row_cls).where(self.row_cls.status == ST_IN_PROGRESS)
+                .order_by(self.row_cls.submitted_at.asc()).limit(limit)
             ).all()
             return [r.to_dict() for r in rows]
 
@@ -327,9 +382,9 @@ class TaskStore:
         cutoff = now - timeout
         with self.session() as s:
             rows = s.scalars(
-                select(TaskRow).where(
-                    TaskRow.status.in_((ST_QUEUED, ST_IN_PROGRESS)),
-                    TaskRow.created_at < cutoff,
+                select(self.row_cls).where(
+                    self.row_cls.status.in_((ST_QUEUED, ST_IN_PROGRESS)),
+                    self.row_cls.created_at < cutoff,
                 )
             ).all()
             ids: list[str] = []
@@ -349,22 +404,30 @@ class TaskStore:
         cutoff = time.time() - retention_days * 86400
         with self.session() as s:
             res = s.execute(
-                delete(TaskRow).where(
-                    TaskRow.created_at < cutoff,
-                    TaskRow.status.in_(tuple(TERMINAL)),
+                delete(self.row_cls).where(
+                    self.row_cls.created_at < cutoff,
+                    self.row_cls.status.in_(tuple(TERMINAL)),
                 )
             )
             return int(res.rowcount or 0)
 
     # ------------------------------------------------------------------ 租约
 
-    def acquire_lease(self, *, owner: str, ttl: float) -> bool:
-        """尝试成为协调器主。**租约过期即可抢占** —— 崩溃的副本不会永久占位。"""
+    def acquire_lease(self, *, owner: str, ttl: float,
+                      leader_key: str = "coordinator") -> bool:
+        """尝试成为协调器主。**租约过期即可抢占** —— 崩溃的副本不会永久占位。
+
+        🔴 `leader_key` **必须按管线区分**（图片 `coordinator` / 视频
+        `coordinator-video`）：两条管线各有自己的协调器，共用一把锁会让
+        先启动的那个把另一个**永久饿死**（任务停在 `queued`、`attempts=0`，
+        而且日志上看起来一切正常）。这是真实端到端实测才暴露出来的缺陷 ——
+        单测里每个用例只建一个协调器，永远碰不到。
+        """
         now = time.time()
         with self.session() as s:
-            row = s.get(LeaseRow, "coordinator")
+            row = s.get(LeaseRow, leader_key)
             if row is None:
-                s.add(LeaseRow(leader_key="coordinator", owner=owner,
+                s.add(LeaseRow(leader_key=leader_key, owner=owner,
                                expires_at=now + ttl))
                 return True
             if row.expires_at < now or row.owner == owner:
@@ -373,12 +436,13 @@ class TaskStore:
                 return True
             return False
 
-    def renew_lease(self, *, owner: str, ttl: float) -> bool:
-        return self.acquire_lease(owner=owner, ttl=ttl)
+    def renew_lease(self, *, owner: str, ttl: float,
+                    leader_key: str = "coordinator") -> bool:
+        return self.acquire_lease(owner=owner, ttl=ttl, leader_key=leader_key)
 
-    def release_lease(self, owner: str) -> None:
+    def release_lease(self, owner: str, leader_key: str = "coordinator") -> None:
         with self.session() as s:
-            row = s.get(LeaseRow, "coordinator")
+            row = s.get(LeaseRow, leader_key)
             if row and row.owner == owner:
                 row.expires_at = 0.0
 
@@ -387,7 +451,7 @@ class TaskStore:
     def stats(self) -> dict[str, Any]:
         with self.session() as s:
             rows = s.execute(
-                select(TaskRow.status, func.count()).group_by(TaskRow.status)
+                select(self.row_cls.status, func.count()).group_by(self.row_cls.status)
             ).all()
         counts = {str(k): int(v) for k, v in rows}
         return {
@@ -395,6 +459,16 @@ class TaskStore:
             "counts": counts,
             "total": sum(counts.values()),
         }
+
+
+class VideoTaskStore(TaskStore):
+    """视频任务库 —— 与 `TaskStore` **逐方法相同**，只换一张表。
+
+    为什么单独起一个实例而不是塞进同一个：协调器与列表端点都按 store 取任务，
+    两套管线各自一个实例 ⇒ 图片任务绝不会出现在视频的列表/轮询集合里。
+    """
+
+    row_cls: type = VideoTaskRow
 
 
 def healthcheck_env() -> dict[str, str]:
@@ -410,5 +484,9 @@ __all__ = [
     "ST_SUCCEEDED",
     "TERMINAL",
     "TaskStore",
+    "TERMINAL",
+    "VideoTaskRow",
+    "VideoTaskStore",
     "new_task_id",
+    "new_video_task_id",
 ]

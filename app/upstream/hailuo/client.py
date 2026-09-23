@@ -7,6 +7,7 @@
 | 用途 | 端点 | body |
 |---|---|---|
 | **建任务** | `/v2/api/multimodal/generate/image` | `{quantity, parameter:{…}, projectID:"0"}` |
+| **建视频任务** | `/v2/api/multimodal/generate/video` | `{quantity, parameter:{modelID, desc, fileList, duration, resolution…}}` |
 | **批量查** | `/api/feed/creation/my/batch` | `{cursor, limit, type:"next", scene:"create", projectID:"0", feedTypes}` |
 | **按 id 直查** | `/v4/api/multimodal/video/processing` | `{batchInfoList:[{batchID, batchType}], type?}` |
 | **在途查** | `/api/feed/creation/my/processing` | `{projectID:"0"}` |
@@ -91,13 +92,16 @@ from . import sign
 # ---------------------------------------------------------------------------
 
 PATH_CREATE_IMAGE = "/v2/api/multimodal/generate/image"
+PATH_CREATE_VIDEO = "/v2/api/multimodal/generate/video"
 PATH_BATCH = "/api/feed/creation/my/batch"
 PATH_PROCESSING = "/api/feed/creation/my/processing"
 #: 按 id 直查。图片（batchType=1）与视频（batchType=0）共用；
 #: 旧形态 `GET /api/multimodal/video/processing?idList=…` 已过时，不实现。
 PATH_V4_PROCESSING = "/v4/api/multimodal/video/processing"
 
-#: 图片 feedType。视频是 0 —— 本服务不做视频，列表里一并过滤掉。
+#: 视频 feedType。与 `BATCH_TYPE_VIDEO` 同数值。
+FEED_TYPE_VIDEO = 0
+#: 图片 feedType。视频是 0 —— 图片列表里一并过滤掉。
 FEED_TYPE_IMAGE = 1
 
 #: v4 直查 body 里的 `batchType` —— **与 feedType 同数值同语义**（0=video，1=image）。
@@ -245,11 +249,61 @@ def parse_feed(raw: dict[str, Any]) -> Feed:
     )
 
 
-def parse_batches(payload: dict[str, Any]) -> list[tuple[str, list[Feed]]]:
-    """`batch` 响应 → `[(batch_id, [Feed, …]), …]`。"""
+def parse_video_feed(raw: dict[str, Any]) -> Feed:
+    """把 `my/batch` 里的一条**视频** feed 解析成 `Feed`。
+
+    🔴 形态 **2026-09-23 用真实视频批次实测钉死**（此前列为"未取证"，因此当时不敢
+    走 `my/batch`）—— 产物在 `metaInfo.videoMetaInfo.mediaInfo`：
+
+    ```json
+    "metaInfo": {"videoMetaInfo": {"hasVoice": false, "duration": 6, "durationMs": 5920,
+      "mediaInfo": {"url": "https://…/x.mp4",
+        "downloadURL": {"watermarkURL": "https://…/wm.mp4",
+                        "withoutWatermarkURL": "https://…/nowm.mp4",
+                        "fileName": "Hailuo_Video_…_<recordId>", "fileID": "…"},
+        "width": 1364, "height": 768}}}
+    ```
+
+    与图片侧的差别只有容器名（`videoMetaInfo` vs `imageMetaInfo`）；
+    「去水印优先」的取法与图片完全一致。
+    """
+    common = raw.get("commonInfo") or {}
+    vmeta = ((raw.get("metaInfo") or {}).get("videoMetaInfo")) or {}
+    media = vmeta.get("mediaInfo") or {}
+    dl = media.get("downloadURL") or {}
+    param = ((raw.get("modelParameter") or {}).get("videoParameter")) or {}
+
+    plain = str(media.get("url") or "")
+    no_wm = str(dl.get("withoutWatermarkURL") or "")
+    return Feed(
+        feed_id=str(common.get("id") or ""),
+        batch_id=str(common.get("batchID") or ""),
+        status=common.get("status"),
+        feed_type=raw.get("feedType"),
+        create_time=common.get("createTime"),
+        url=no_wm or plain,
+        url_no_watermark=no_wm,
+        width=media.get("width"),
+        height=media.get("height"),
+        file_id=str(dl.get("fileID") or ""),
+        file_name=str(dl.get("fileName") or ""),
+        model_id=str(param.get("modelID") or ""),
+        desc=str(param.get("desc") or ""),
+        message=str((raw.get("feedMessage") or {}).get("message") or ""),
+        raw=raw,
+    )
+
+
+def parse_batches(payload: dict[str, Any], *,
+                  video: bool = False) -> list[tuple[str, list[Feed]]]:
+    """`batch` 响应 → `[(batch_id, [Feed, …]), …]`。
+
+    `video=True` 时走视频产物路径（`metaInfo.videoMetaInfo`）。
+    """
     out: list[tuple[str, list[Feed]]] = []
+    parser = parse_video_feed if video else parse_feed
     for batch in ((payload or {}).get("data") or {}).get("batchFeeds") or []:
-        feeds = [parse_feed(f) for f in (batch.get("feeds") or [])]
+        feeds = [parser(f) for f in (batch.get("feeds") or [])]
         out.append((str(batch.get("batchID") or ""), feeds))
     return out
 
@@ -490,8 +544,17 @@ class HailuoClient:
         low = msg.lower()
         if any(k in msg for k in ("登录", "token", "未授权")) or code in (1001, 1002):
             raise AuthError(f"hailuo 业务层鉴权失败（code={code}）：{msg}")
-        if "积分" in msg or "额度" in msg or "余额" in msg or "quota" in low:
-            raise UpstreamQuotaExhausted(f"上游额度不足（code={code}）：{msg}")
+        #: 🔴 **「贝壳」是视频侧的积分叫法**（图片侧说"积分"）。2026-09-23 实测：
+        #: 视频建任务余额不足时回 `code=2200005 贝壳不足`，而它**不含**"积分/额度/余额"
+        #: 任何一个词 —— 只按文案匹配会把它漏成通用 `upstream_error`，
+        #: 调用方拿不到"充值"这个可执行结论，甚至可能重试。
+        if ("积分" in msg or "额度" in msg or "余额" in msg or "贝壳" in msg
+                or "quota" in low or "insufficient" in low
+                or code in (30, 2200005)):
+            raise UpstreamQuotaExhausted(
+                f"上游额度不足（code={code}）：{msg}。"
+                f"⚠️ 这是**账户级**结果，重试无用 —— 请为该账号充值"
+                f"（视频侧余额叫「贝壳」）。")
         if "频繁" in msg or "限流" in msg or "风控" in msg or "verify" in low:
             raise RiskControlChallenge(f"上游风控/频控（code={code}）：{msg}")
         if "敏感" in msg or "审核" in msg or "违规" in msg or "policy" in low:
@@ -581,15 +644,101 @@ class HailuoClient:
             f"上游已受理图片任务：batch={batch_id} record={record_id} model={model_id} n={quantity}")
         return batch_id, trace
 
+    def create_video(
+        self,
+        *,
+        model_id: str,
+        desc: str,
+        file_list: list[dict[str, Any]],
+        duration: int,
+        resolution: str | None = None,
+        aspect_ratio: str | None = None,
+        quantity: int = 1,
+        use_origin_prompt: bool = True,
+        dry_run: bool = False,
+    ) -> tuple[str, dict[str, Any]]:
+        """建一次**视频**生成任务。返回 `(upstream_batch_id, trace)`。
+
+        🔴 **这是计费动作**（视频单价远高于图片：Hidden 768p/6s 15 积分起步，
+        sora2 12s 要 120 积分）。`dry_run=True` 时零消耗。
+
+        请求体对齐参考实现（`MeUtils/apis/hailuoai/openai_videos.create_task`，
+        生产在跑）+ 其中的真实抓包注释（`fileList[]` 形态见 `upload.py`）：
+
+        ```json
+        {"quantity": 1,
+         "parameter": {"modelID": "23218", "desc": "…", "fileList": [{"frameType": 0, …}],
+                       "useOriginPrompt": true, "duration": 6, "resolution": "768",
+                       "aspectRatio": "16:9"}}
+        ```
+
+        与图片端点的**唯一结构性差别**是 `fileList[].frameType`：
+        0 = 首帧、1 = 尾帧（`start-end-frames` 模式）。没有框架图时传空数组
+        —— 那就是文生视频（t2v）。
+
+        ⚠️ 与图片端点的**两处刻意不同**，都是"逐字段对齐参考实现"的结果：
+
+        1. 🔴 **`aspectRatio` 总是带上**（无比例时填空串 `""`）——
+           参考实现无条件写这个键，而它的 `23204` / `23210` / `23218` 正在生产跑
+           ⇒ "填空串"是**已知可用**的形态，而"省略这个键"是**没人跑过**的变体。
+           （这与图片侧"只放有值的键"的纪律相反：那边的抓包证据支持省略。）
+        2. **不带 `projectID`** —— 视频请求在参考实现里没有这个键
+           （图片端点才有，来自前端 `MS()`）。
+
+        ⚠️ 与图片同样有 `data.id` / `data.task.batchID` **两个 id 的陷阱**：
+        轮询句柄是 `data.task.batchID`（详见 `create_image` 的注释）。
+        """
+        parameter: dict[str, Any] = {
+            "modelID": model_id,
+            "desc": desc,
+            "fileList": file_list,
+            "useOriginPrompt": bool(use_origin_prompt),
+            "duration": int(duration),
+            #: 🔴 恒存在（可能为空串），见上面第 1 条
+            "aspectRatio": str(aspect_ratio) if aspect_ratio else "",
+        }
+        if resolution:
+            parameter["resolution"] = str(resolution)
+
+        body = {"quantity": int(quantity), "parameter": parameter}
+
+        payload, trace = self.request("POST", PATH_CREATE_VIDEO, body, dry_run=dry_run)
+        if dry_run:
+            return "", trace
+
+        data = payload.get("data") or {}
+        task = data.get("task") or {}
+        batch_id = str(task.get("batchID") or "")
+        record_id = str(data.get("id") or "")
+        trace["upstream_record_id"] = record_id
+        #: 缺 batchID 时的兜底同图片：宁可用记录 id，也不要丢掉一个已经付了钱的任务
+        if not batch_id:
+            batch_id = record_id
+            trace["batch_id_fallback_to_record"] = True
+        trace["upstream_submit_id"] = batch_id
+        if not batch_id:
+            raise UpstreamError(
+                f"上游受理成功但响应里没有 batch id："
+                f"{json.dumps(data, ensure_ascii=False)[:300]}")
+        logger.bind(upstream_submit_id=batch_id, model_id=model_id).info(
+            f"上游已受理视频任务：batch={batch_id} record={record_id} "
+            f"model={model_id} frames={len(file_list)} duration={duration}")
+        return batch_id, trace
+
     def fetch_batches(
         self, *, limit: int = 30, cursor: str = "", feed_types: list[int] | None = None,
-        project_id: str = "0", dry_run: bool = False,
+        project_id: str = "0", video: bool = False, dry_run: bool = False,
     ) -> tuple[list[tuple[str, list[Feed]]], dict[str, Any]]:
         """批量查任务（"我最近 N 条"，**不带 id 过滤**）。
 
         🔴 **这是本项目"批量轮询"能力的来源**：一次请求就能覆盖**全部**在途任务。
         所以协调器**每个 tick 只打一次上游**，而不是每个任务打一次。
         逐个 id 的点名查询见 `fetch_by_ids`（互补，不是替代）。
+
+        `video=True` ⇒ `feedTypes=[0]` 且产物按 `videoMetaInfo` 解析。
+        ⚠️ 视频也走这条端点（2026-09-23 实测确认：video feed 在
+        `metaInfo.videoMetaInfo.mediaInfo`），**不要**改回 v4 ——
+        v4 的 `batchType=0` 对视频批次恒回空（实测 4 种 `type` 组合全空）。
         """
         body = {
             "cursor": cursor,
@@ -597,13 +746,14 @@ class HailuoClient:
             "type": "next",
             "scene": "create",
             "projectID": project_id,
-            "feedTypes": feed_types if feed_types is not None else [FEED_TYPE_IMAGE],
+            "feedTypes": feed_types if feed_types is not None
+                         else ([FEED_TYPE_VIDEO] if video else [FEED_TYPE_IMAGE]),
         }
         payload, trace = self.request("POST", PATH_BATCH, body, dry_run=dry_run,
                                       idempotent=True)  # 查询：连接级失败可重试
         if dry_run:
             return [], trace
-        batches = parse_batches(payload)
+        batches = parse_batches(payload, video=video)
         trace["batch_count"] = len(batches)
         trace["feed_count"] = sum(len(f) for _, f in batches)
         trace["has_next"] = bool((payload.get("data") or {}).get("hasNext"))
@@ -709,16 +859,19 @@ __all__ = [
     "BATCH_TYPE_VIDEO",
     "FAILED",
     "FEED_TYPE_IMAGE",
+    "FEED_TYPE_VIDEO",
     "Feed",
     "HailuoClient",
     "IN_PROGRESS",
     "PATH_BATCH",
     "PATH_CREATE_IMAGE",
+    "PATH_CREATE_VIDEO",
     "PATH_PROCESSING",
     "PATH_V4_PROCESSING",
     "SUCCEEDED",
     "parse_batches",
     "parse_feed",
     "parse_v4_batches",
+    "parse_video_feed",
     "status_name",
 ]

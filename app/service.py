@@ -185,6 +185,9 @@ KNOWN_UNSUPPORTED: dict[str, str] = {
 class Service:
     """编排层。持有 store / client / uploader / gate，是唯一改任务状态的地方。"""
 
+    #: 产物计数的单位（日志/观测用）。视频管线覆写为"条"。
+    produced_unit: str = "张图"
+
     def __init__(
         self,
         settings: Settings,
@@ -869,6 +872,22 @@ class Service:
             group_out["fallback"] = fallback
         return group_out
 
+    def _success_payload(self, feeds: list[Feed]) -> dict[str, Any]:
+        """成功时写进 `result` 的形状（**图片**：`data[{url}]` + 水印两版直链）。
+
+        `VideoService` 覆写它（视频要的是 Seedance 的 asset 语义）。
+        """
+        return {
+            "data": [{"url": f.url} for f in feeds],
+            "created": int((feeds[0].create_time or time.time() * 1000) / 1000),
+            "images": len(feeds),
+            "model_id": feeds[0].model_id,
+            "width": feeds[0].width,
+            "height": feeds[0].height,
+            "file_name": feeds[0].file_name,
+            "url_no_watermark": [f.url_no_watermark for f in feeds],
+        }
+
     def _apply_feeds(self, task_id: str, feeds: list[Feed]) -> bool:
         """把上游某个 batch 下的 feeds 应用到本地任务。返回是否推进了终态。
 
@@ -912,19 +931,15 @@ class Service:
                 **({"upstream_feed_id": primary.feed_id} if primary.feed_id else {}),
                 upstream_status=primary.status,
                 finished_at=time.time(),
-                result={
-                    "data": [{"url": f.url} for f in success],
-                    "created": int((success[0].create_time or time.time() * 1000) / 1000),
-                    "images": len(success),
-                    "model_id": success[0].model_id,
-                    "width": success[0].width,
-                    "height": success[0].height,
-                    "file_name": success[0].file_name,
-                    "url_no_watermark": [f.url_no_watermark for f in success],
-                },
+                #: 🔴 `result` 的形状由**管线**决定（图片 data[{url}] / 视频 asset 直链），
+                #: 所以走 `self._success_payload` —— 子类只覆写这一个方法即可。
+                result=self._success_payload(success),
             )
-            OBS.event("task.succeeded", task_id=task_id, images=len(success))
-            logger.bind(task_id=task_id).info(f"任务成功：{len(success)} 张图")
+            OBS.event("task.succeeded", task_id=task_id, produced=len(success))
+            #: 计数单位由**管线**决定（图片"张" / 视频"条"）—— 别让视频任务的日志
+            #: 说"1 张图"，那会让人以为产物类型判错了。
+            logger.bind(task_id=task_id).info(
+                f"任务成功：{len(success)} {self.produced_unit}")
             return True
 
         # 零产物 + 有失败 ⇒ 失败（取第一条失败原因）

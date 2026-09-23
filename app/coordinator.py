@@ -57,13 +57,27 @@ class CoordinatorStats:
 class Coordinator:
     """后台线程。**`start()`/`stop()` 由 lifespan 调用。**"""
 
-    def __init__(self, service: Service, settings: Settings) -> None:
+    def __init__(self, service: Service, settings: Settings, *,
+                 task_timeout: float | None = None,
+                 poll_interval: float = 0.0,
+                 leader_key: str = "coordinator") -> None:
         self.service = service
         self.settings = settings
         self.owner = f"coord-{uuid.uuid4().hex[:12]}"
+        #: 🔴 **选主键必须按管线区分**：图片与视频各有自己的协调器，
+        #: 共用一把锁 ⇒ 先启动的那个把另一个永久饿死（任务恒 `queued`、`attempts=0`，
+        #: 日志上却看不出异常）。
+        self.leader_key = leader_key
         self.stats = CoordinatorStats()
         self._thread: threading.Thread | None = None
         self._stop = threading.Event()
+        #: **看门狗超时**：图片用 `TASK_TIMEOUT`，视频用 `VIDEO_TASK_TIMEOUT`
+        #: （视频生成是分钟级，用图片的 900s 会把还在跑的任务判死 —— 而上游仍在计费）。
+        self.task_timeout = task_timeout if task_timeout is not None else settings.task_timeout
+        #: **轮询节流**：`0` = 每轮都问（图片链路的既有行为）；
+        #: 视频协调器传 `VIDEO_POLL_INTERVAL`（默认 10s）⇒ 一轮 tick 最多问一次上游。
+        self.poll_interval = poll_interval
+        self._last_poll_at = 0.0
         #: 受理路径用它叫醒协调器（纯优化：唤醒丢了只是慢一个 tick，
         #: "该派发谁"始终由库里的状态决定）
         self._wake = threading.Event()
@@ -77,12 +91,15 @@ class Coordinator:
             return
         if self._thread is not None:
             return
-        #: 租约用 PostgreSQL/SQLite 表 ⇒ 多副本安全；单副本时首轮即拿到
+        #: 租约用 PostgreSQL/SQLite 表 ⇒ 多副本安全；单副本时首轮即拿到。
+        #: `leader_key` 区分**同一条管线**的多个副本（图片与视频互不同锁）。
         self.service.store.acquire_lease(owner=self.owner,
-                                        ttl=self.settings.coordinator_lease)
+                                         ttl=self.settings.coordinator_lease,
+                                         leader_key=self.leader_key)
         self._thread = threading.Thread(target=self._run, name="coordinator", daemon=True)
         self._thread.start()
-        logger.info(f"协调器已启动（owner={self.owner}, tick={self.settings.coordinator_tick}s）")
+        logger.info(f"协调器已启动（owner={self.owner}, tick={self.settings.coordinator_tick}s, "
+                    f"leader_key={self.leader_key}）")
 
     def stop(self, timeout: float = 5.0) -> None:
         self._stop.set()
@@ -91,7 +108,7 @@ class Coordinator:
             self._thread.join(timeout=timeout)
             self._thread = None
         try:
-            self.service.store.release_lease(self.owner)
+            self.service.store.release_lease(self.owner, leader_key=self.leader_key)
         except Exception as e:  # noqa: BLE001
             # 释放租约失败 ⇒ 最坏情况是等租约自然过期（默认 30s）后被别的副本抢占。
             # 不影响正确性，但要让它在日志里可见 —— 否则"主选举频繁抖动"无从查起。
@@ -131,20 +148,25 @@ class Coordinator:
 
         # ① 续租 —— 拿不到就只做只读的事（不建任务）
         is_leader = self.service.store.acquire_lease(
-            owner=self.owner, ttl=self.settings.coordinator_lease)
+            owner=self.owner, ttl=self.settings.coordinator_lease,
+            leader_key=self.leader_key)
         if not is_leader:
             self.stats.leader_skips += 1
             return self.stats
 
         # ② 看门狗
-        expired = self.service.store.expire_stale(timeout=self.settings.task_timeout)
+        expired = self.service.store.expire_stale(timeout=self.task_timeout)
         if expired:
             self.stats.expired += len(expired)
             logger.warning(f"看门狗收掉 {len(expired)} 个超时任务：{expired}")
 
-        # ③ 批量轮询（**一次上游查询**）
+        # ③ 批量轮询（**一次上游查询**；`poll_interval > 0` 时按间隔节流）
         in_flight = self.service.store.in_flight()
-        if in_flight:
+        now = time.time()
+        due = (self.poll_interval <= 0
+               or now - self._last_poll_at >= self.poll_interval)
+        if in_flight and due:
+            self._last_poll_at = now
             try:
                 res = self.service.poll_many(in_flight)
                 self.stats.polled_batches += 1

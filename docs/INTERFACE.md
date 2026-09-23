@@ -1,7 +1,11 @@
-# 对外契约（冻结）
+# 对外契约（冻结）· 图片链路
 
-> 本文件是**唯一的对外契约真相**。改动 = 破坏调用方，必须同步 `tests/test_api.py`。
+> 本文件是**图片链路唯一的对外契约真相**。改动 = 破坏调用方，必须同步 `tests/test_api.py`。
 > 上游侧的字段、签名与错误码在 `docs/UPSTREAM.md`；推导过程在 `.workbuddy/memory/`。
+>
+> 📹 **视频链路是另一份契约**：火山方舟 Seedance 原生协议，
+> 端点 `/api/v3/contents/generations/tasks*` 与 `/v1/models`，
+> 见 **[`docs/SEEDANCE.md`](SEEDANCE.md)**。两条链路同进程、**不同表**、互不影响。
 
 ---
 

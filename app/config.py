@@ -119,6 +119,16 @@ class Settings:
     #: 🔴 **唯一的任务超时旋钮**（曾经同时有 `HL_MAX_WAIT` 与 `TASK_TIMEOUT`
     #: 两个旋钮指同一件事 —— 改了一个另一个不生效，是典型的"改了没效果"来源）。
     task_timeout: float = 900.0
+    #: **视频**任务单独一个超时：视频生成比出图慢一个量级（实测 veo/1080p 分钟级），
+    #: 用图片的 900s 会把还在跑的任务判死 —— 而上游仍在计费。
+    video_task_timeout: float = 3600.0
+    #: 视频轮询间隔（秒）。视频一轮只打 **1 次** v4 点名查询，10s 足够；
+    #: 太密只会白问（视频生成是分钟级的）。
+    video_poll_interval: float = 10.0
+    #: 列表端点 `GET /api/v3/contents/generations/tasks` 是否**要求**凭据。
+    #: 🔴 默认 **1**。它会列出任务 id，而 id 就是读接口的凭据 ⇒ 无凭据开放
+    #: 等于把凭据派发出去。确要开放请显式设 0（带凭据时仍只列自己的）。
+    video_list_require_auth: bool = True
 
     # ------------------------------------------------------------ 协调器
     coordinator_enabled: bool = True
@@ -240,6 +250,9 @@ class Settings:
             hailuo_poll_interval=_f("HAILUO_POLL_INTERVAL", 5.0),
             poll_grace=_f("POLL_GRACE", 0.5),
             task_timeout=_f("TASK_TIMEOUT", 900.0),
+            video_task_timeout=_f("VIDEO_TASK_TIMEOUT", 3600.0),
+            video_poll_interval=_f("VIDEO_POLL_INTERVAL", 10.0),
+            video_list_require_auth=_b("VIDEO_LIST_REQUIRE_AUTH", True),
             coordinator_enabled=_b("COORDINATOR_ENABLED", True),
             coordinator_tick=_f("COORDINATOR_TICK", 1.0),
             coordinator_lease=_f("COORDINATOR_LEASE", 30.0),
@@ -289,6 +302,10 @@ class Settings:
             raise ConfigError("INGEST_PARALLELISM 必须 >= 1")
         if self.coordinator_lease < self.hailuo_poll_interval * 2:
             raise ConfigError("COORDINATOR_LEASE 必须 >= 2×HAILUO_POLL_INTERVAL")
+        if self.video_task_timeout <= 0:
+            raise ConfigError("VIDEO_TASK_TIMEOUT 必须 > 0")
+        if self.video_poll_interval <= 0:
+            raise ConfigError("VIDEO_POLL_INTERVAL 必须 > 0")
         if self.hailuo_max_side_guard():
             raise ConfigError(
                 "HAILUO_SCREEN_WIDTH/HEIGHT 必须为正整数（它们参与签名）")

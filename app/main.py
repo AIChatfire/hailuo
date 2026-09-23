@@ -36,7 +36,9 @@ from .config import Settings
 from .coordinator import Coordinator
 from .errors import AdapterError, AuthError, InvalidParameterError
 from .observability import OBS, excluded_urls, is_probe_path, setup_logging, should_log_path
+from .seedance_api import install_video_routes
 from .service import Service, view
+from .video_service import VideoService
 
 
 # ---------------------------------------------------------------------------
@@ -150,10 +152,13 @@ def create_app(settings: Settings | None = None,
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> Iterator[None]:
         app.state.coordinator.start()
+        app.state.video_coordinator.start()
         try:
             yield
         finally:
+            app.state.video_coordinator.stop()
             app.state.coordinator.stop()
+            app.state.video_service.close()
             app.state.service.close()
             # 短命进程必须显式 flush，否则退出时最后一批 span 直接丢
             OBS.flush()
@@ -174,6 +179,20 @@ def create_app(settings: Settings | None = None,
     app.state.service = service
     app.state.coordinator = Coordinator(service, settings)
 
+    #: **视频**链路（火山 Seedance 协议出口）。与图片**同一进程、另一张表**。
+    #: 测试里 `service` 是注入的桩 ⇒ 这里跟着用同一套依赖，避免它去摸真实网络。
+    video_settings = settings.replace(
+        task_timeout=settings.video_task_timeout)
+    video_service = VideoService(video_settings, fetch_capabilities=False,
+                                 http_transport=getattr(service, "_http_transport", None))
+    app.state.video_service = video_service
+    app.state.video_coordinator = Coordinator(
+        video_service, video_settings,
+        task_timeout=settings.video_task_timeout,
+        poll_interval=settings.video_poll_interval,
+        #: 🔴 两条管线各一把锁 —— 共用 `coordinator` 会让先启动的把另一个永久饿死
+        leader_key="coordinator-video")
+
     if not service.store.ping():
         # 任务库是**事实源**：连不上就别装作能服务。刻意不做"连不上就退回内存"的降级。
         raise RuntimeError(
@@ -183,6 +202,7 @@ def create_app(settings: Settings | None = None,
     _install_error_handlers(app)
     _install_request_logging(app)
     _install_routes(app)
+    install_video_routes(app)
 
     for w in settings.startup_warnings:
         logger.warning(w)

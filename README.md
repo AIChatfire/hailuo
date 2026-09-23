@@ -1,20 +1,35 @@
 # hailuo-service
 
-hailuo（`hailuoai.video`）图片生成的**异步**出口。参考 `../jimeng` 的骨架落地，
-做成 `POST` 受理 → `GET` 轮询的两段式。
+hailuo（`hailuoai.video`）的**异步**出口，两条链路同进程、互不影响：
+
+**① 图片**（`POST` 受理 → `GET` 轮询两段式，参考 `../jimeng` 的骨架落地）
 
 ```
 POST   /async/v1/images/generations        → 202 {"task_id": "hailuo_…"}   只回一个 id
 GET    /async/v1/images/generations/{id}   → 202 排队态 / 200 {data,created,usage}
 GET    /async/v1/images/generations        → 本 Key 的任务列表
 DELETE /async/v1/images/generations/{id}   → 删除**已终态**的任务
-GET    /async/v1/models                    → 能力清单 + 上游模型注册表
+GET    /async/v1/models                    → 图片能力清单 + 上游模型注册表
 ```
 
-契约全文见 **[`docs/INTERFACE.md`](docs/INTERFACE.md)**（冻结）；
+**② 视频**（**火山方舟 Seedance 原生协议**，路径逐字等于原生）
+
+```
+POST   /api/v3/contents/generations/tasks        → {"id": "cgt-…"}   只回一个 id
+GET    /api/v3/contents/generations/tasks/{id}   → 原生任务对象（六态），**免鉴权**
+GET    /api/v3/contents/generations/tasks        → {items,total,page_num,page_size}
+DELETE /api/v3/contents/generations/tasks/{id}   → 删除**已终态**的任务
+GET    /v1/models                                → OpenAI 形态清单（图片 + 视频），**免鉴权**
+```
+
+契约全文见 **[`docs/INTERFACE.md`](docs/INTERFACE.md)**（图片，冻结）与
+**[`docs/SEEDANCE.md`](docs/SEEDANCE.md)**（视频，冻结）；
 上游契约与逆向导出的结论见 **[`docs/UPSTREAM.md`](docs/UPSTREAM.md)**。
 
-**重点能力是图生图（`hailuo-i2i`）** —— 见 §3。
+**图片重点能力是图生图（`hailuo-i2i`）** —— 见 §3。
+**视频的核心是"输入形态内部自判"**：`content[]` 里给不给图、给首帧还是首尾帧，
+决定落到 Hailuo 2.x 的三个模型槽位之一 —— 调用方不需要记住 26 个 modelID，
+但**每一项被改动的参数都会出现在 `degradations` 里**。
 
 ---
 
@@ -22,17 +37,23 @@ GET    /async/v1/models                    → 能力清单 + 上游模型注册
 
 | 我想… | 看这里 |
 |---|---|
-| 接这个服务 | `docs/INTERFACE.md` |
+| 接图片链路 | `docs/INTERFACE.md` |
+| 接视频链路（Seedance 协议） | `docs/SEEDANCE.md` |
 | **改 `yy` 签名** | `app/upstream/hailuo/sign.py`（**5 条抓包向量自证**） |
-| 改"谁能做什么 / 默认模型" | `app/models.py`（唯一的能力注册表） |
-| 改请求翻译（`size`/`n`/图片张数） | `app/service.py::build_plan`（**纯函数，重点覆盖**） |
+| 改"图片能用什么 / 默认模型" | `app/models.py`（唯一的能力注册表） |
+| 改图片请求翻译（`size`/`n`/图片张数） | `app/service.py::build_plan`（**纯函数，重点覆盖**） |
+| 改"视频能用什么 / 首尾帧怎么落" | `app/upstream/hailuo/video_models.py`（族 + 三个槽位） |
+| 改视频请求翻译（`content[]` → 计划） | `app/video_service.py::build_video_plan`（**纯函数**） |
+| 改视频响应形状 | `app/video_service.py::video_view` —— **唯一出口** |
+| 改视频路由/鉴权 | `app/seedance_api.py` |
 | 改上游请求构造 / 错误码分类 | `app/upstream/hailuo/client.py` |
 | 改输入图上传 | `app/upstream/hailuo/upload.py` |
 | 改输入图下载/归一化 | `app/media.py` |
 | 改"什么时候轮到谁跑" | `app/coordinator.py` + `app/gate.py` |
-| 改任务存取 | `app/store.py` |
-| 改响应形状 | `app/service.py::view` —— **唯一出口** |
+| 改任务存取 | `app/store.py`（图片/视频**各一张表**，同一个实现） |
+| 改图片响应形状 | `app/service.py::view` —— **唯一出口** |
 | 改埋点 | `app/observability.py` —— **唯一收拢点** |
+| 核对上游视频模型清单/价格（**零计费**） | `scripts/probe_video.py` |
 
 ---
 
@@ -198,6 +219,70 @@ curl -s localhost:8300/async/v1/images/generations/hailuo_… \
 
 ---
 
+## 3.9 视频怎么调（Seedance 协议）
+
+```bash
+# 文生视频（content 里只有 text ⇒ 内部落到 23204）
+curl -s -X POST localhost:8300/api/v3/contents/generations/tasks \
+  -H 'Authorization: Bearer <你的 hailuo token>' -H 'Content-Type: application/json' \
+  -d '{"model":"hailuo-video","content":[{"type":"text","text":"镜头缓慢推近"}],
+       "duration":6,"resolution":"1080p","ratio":"16:9"}'
+# → {"id":"cgt-20260923004105-a1b2c3d4e5"}
+
+# 首尾帧（两个 role ⇒ 内部落到 23210）
+curl -s -X POST localhost:8300/api/v3/contents/generations/tasks \
+  -H 'Authorization: Bearer <你的 hailuo token>' -H 'Content-Type: application/json' \
+  -d '{"model":"hailuo-video","content":[
+        {"type":"text","text":"人物转头微笑"},
+        {"type":"image_url","image_url":{"url":"https://…/first.png"},"role":"first_frame"},
+        {"type":"image_url","image_url":{"url":"https://…/last.png"},"role":"last_frame"}],
+       "duration":6}'
+
+# 查询（**免鉴权**，id 本身就是凭据）
+curl -s localhost:8300/api/v3/contents/generations/tasks/cgt-20260923004105-a1b2c3d4e5
+# → {"id":"cgt-…","status":"succeeded","content":{"video_url":"https://…/out.mp4"},
+#    "usage":{"completion_tokens":0,"total_tokens":0,"forecast_credits":25},
+#    "duration":6,"resolution":"1080p","ratio":"16:9","framespersecond":24,…}
+
+# OpenAI 形态的模型清单（免鉴权）
+curl -s localhost:8300/v1/models | jq '.data[].id'
+```
+
+要点：
+
+- **形态由输入决定**：只有 text → 文生、有首帧 → 图生、首帧+尾帧 → 首尾帧。
+  三者分别落到 `23204` / `23218` / `23210`（默认族 `hailuo-video`，**逐条对齐生产参考实现**）；
+- **先看 `degradations`**：档位/时长被吸附、`ratio` 没转发给人、`watermark` 被忽略……
+  全在那里逐条写明。**静默降级在这个项目里是不允许的** ——
+  视频一次最高 180 积分，静默换档是最贵的一类 bug；
+- **直接传上游 modelID**（如 `"model":"23218"`）也支持，零映射零说明；
+  但它接不住你的输入时会 **400 并指出该用哪个**，不会悄悄换模型；
+- `duration` 不在档位 ⇒ **向下吸附**（向上等于替人加钱）；`resolution` 吸附到最接近档；
+- 🔴 **带框架图时档位有门禁**：上游按档位声明 `supportFrame`，只许落在声明支持的档上
+  （`23210` 的 512 档**没**声明 —— 实测拿它跑首尾帧会得到 `code 2400001` 且白花积分）；
+- 视频**单独一个看门狗** `VIDEO_TASK_TIMEOUT=3600`（视频是分钟级的，
+  图片的 900s 会把还在跑的任务判死，而它仍在计费）；
+- 视频轮询**主路径是 `my/batch`（`feedTypes=[0]`）**，产物在
+  `metaInfo.videoMetaInfo.mediaInfo`；**`v4` 的 `batchType=0` 对视频恒回空**
+  （实测 4 种 `type` 组合全空）⇒ 它只能做兜底，且必须用 **`data.id`（记录 id）** 当 batchID。
+  ⚠️ 这条是**实测纠正**过来的：最初照参考实现只走 v4，结果上游 2 分钟出片、
+  我们轮询 15 分钟没看见、最后判 `expired` —— **钱花了、片出来了、没拿到**。
+
+**hailuo 系列实测跑通（2026-09-23，13 个模型里 11 个 ✅）**：
+
+| 族 | modelID | 已验证形态 | 结果 |
+|---|---|---|---|
+| Hailuo 2.3 | `23204` / `23217` | 文生 / 仅首帧 | ✅ 145s、~2 min |
+| Hailuo 2.3-Fast | `23218` | 仅首帧 | ✅ 85s（15 积分，最省） |
+| Hailuo 2.0 | `23200` / `23210` | 文生 / **首尾帧** | ✅、1364×768 |
+| Hailuo 1.0 / -Director / -Live | `23000` `23001` `23010` `23102` `23011` | 文生 / 仅首帧 | ✅ 5/5 全过 |
+| MiniMax H3 / H3 Max | `hailuo3.0*` `hailuo_h3_max_*` | — | 🔴 `2200005 贝壳不足`（**免费账户不可用**，非余额问题） |
+
+产物在 `e2e-output/video/`（11 段）；`usage.forecast_credits` 与计价表逐条对上。
+未实跑：`veo3.1` / `sora2` / seedance2.0*（见 §6）。
+
+---
+
 ## 4. 扩容前必读
 
 **默认 `WORKERS=1` 是架构约束，不是保守参数：**
@@ -281,13 +366,18 @@ python scripts/e2e.py --phases generate --allow-real-submit
 
 ## 6. 诚实边界（未取证的事）
 
-完整清单在 `docs/UPSTREAM.md` §8。最关键的三条：
+完整清单在 `docs/UPSTREAM.md` §8（图片）与 `docs/SEEDANCE.md` §6（视频）。
 
 | 事项 | 状态 |
 |---|---|
-| **端到端真实出图** | 🔴 **本项目未做**（建任务即计费）。上游链路已按抓包与非计费只读调用逐层验证，但"建任务 → 出图"这一段**没有实跑过** |
-| 产物 URL 有效期 | **未取证** ⇒ 原样透传、不做转存 |
+| **图片端到端真实出图** | 🔴 **本项目未做**（建任务即计费）。上游链路已按抓包与非计费只读调用逐层验证，但"建任务 → 出图"这一段**没有实跑过** |
+| 图片产物 URL 有效期 | **未取证** ⇒ 原样透传、不做转存 |
 | 上游并发/频控阈值 | **未界定** ⇒ 默认并发 1 是策略选择，不是实测上限 |
+| **视频端到端真实出片** | ✅ **hailuo 系列 11/13 已实跑**（2026-09-23，见 §3.9 台账）。未实跑：`veo3.1` / `sora2` / seedance2.0* —— body 同构，但各自可能另有前置校验（512 档那次就是） |
+| 视频的**账户档位门槛** | 🔴 实测：`hailuo3.0*` 与 `hailuo_h3_max_*` 对**免费账户**（`vipInfo.type=0`）回 `2200005 贝壳不足`；同一时刻 2.x/1.0 系**照常可用** ⇒ 是档位门槛不是余额。**无只读端点可预知贝壳是否够**（`/v1/api/user/info` 里没有余额字段） |
+| 视频 `my/batch` 的产物字段路径 | ✅ **已取证**：`metaInfo.videoMetaInfo.mediaInfo.{url,downloadURL,width,height}`（同一次实测） |
+| 视频 `v4` 的可用性 | 🔴 **实测：`batchType=0` 对视频恒回空**（4 种 `type` 组合全空）⇒ 只能按**记录 id** 兜底。若上游日后改了它，`verify_video_poll.py` 会立刻发现 |
+| 视频多参考图 / 主体参考 / 视频延长 / 音频参考 | **未取证** ⇒ 不实现，传了就 **400**（不静默降级） |
 
 ---
 
@@ -298,15 +388,20 @@ app/
   main.py             FastAPI 装配：路由 / 错误信封 / lifespan / 埋点接线
   config.py           Settings（每个旋钮都必须有人读）
   errors.py           错误分类体系（对外错误信封）
-  models.py           能力注册表 + 上游模型冻结快照（唯一真相）
+  models.py           **图片**能力注册表 + 上游模型冻结快照（唯一真相）
   media.py            输入图嗅探 / 下载（含 SSRF 防线）/ 归一化
-  service.py          编排：受理 / 翻译（build_plan）/ 提交 / 轮询 / 响应构造
-  coordinator.py      后台协调器（推进任务的唯一执行者）
+  service.py          **图片**编排：受理 / 翻译（build_plan）/ 提交 / 轮询 / 响应构造
+  video_service.py    **视频**编排：Seedance content[] 翻译 / 提交 / v4 轮询 / 原生响应
+  seedance_api.py     火山 Seedance 协议端点 + `/v1/models`
+  coordinator.py      后台协调器（推进任务的唯一执行者；图片/视频各一个）
   gate.py             节奏闸门（间隔 / 每分钟上限 / 风控冷却）
-  store.py            SQLAlchemy 任务存储 + 指纹密钥 + 协调器租约
+  store.py            SQLAlchemy 任务存储（tasks / video_tasks 两表同一实现）+ 租约
   observability.py    logfire + loguru 单一收拢点
   upstream/hailuo/    sign（yy 签名）/ client / upload（OSS STS）/ capabilities
+                      + video_models（视频注册表与族路由）/ video_capabilities
 tests/                见 §5
-docs/                 INTERFACE.md（对外契约）/ UPSTREAM.md（上游契约与逆向结论）
-scripts/e2e.py        零成本优先的端到端探针
+docs/                 INTERFACE.md（图片契约）/ SEEDANCE.md（视频契约）
+                      / UPSTREAM.md（上游契约与逆向结论）
+scripts/e2e.py        零成本优先的端到端探针（图片）
+scripts/probe_video.py 上游视频模型清单/价格对账（**零计费**，不建任务）
 ```
